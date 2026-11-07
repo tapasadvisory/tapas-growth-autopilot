@@ -1,54 +1,75 @@
-# TAPAS Growth Autopilot
+# TAPAS Growth Autopilot — private internal platform
 
-**A local-first command centre for one practice's entire social growth engine** — built by [TAPAS Advisory](https://tapasadvisory.com) to run its own multi-platform presence without handing credentials to a third-party SaaS.
-
-It connects eight platforms behind one local backend, plans the daily "Golden Hour" of engagement, drafts AI-assisted comments that a human always reviews, tracks community relationships, and records analytics snapshots with provenance — so every number can be traced to the provider response that produced it.
-
-## Why local-first?
-
-Consulting practices live on trust. Growth Autopilot keeps OAuth tokens on your own machine, encrypted at rest, and binds to localhost by default. No third-party service ever holds your accounts. Discovery and drafting are automated; **publishing and engagement decisions stay human** — by design, not by limitation.
+TAPAS Advisory's local-first Growth Autopilot. It is a private internal workspace, not a SaaS service for sale.
 
 ## Modules
 
-- **Command Centre & Golden Hour planning** — 30/60/90-minute campaign plans built from connected accounts and due tasks
-- **Smart Comments (Gemini)** — AI-drafted comment suggestions, fail-closed when unconfigured, always human-reviewed; nothing posts automatically
-- **Community Intelligence** — a relationship register for the people who actually engage with your work
-- **Auto-Discovery** — rule-based scans across supported sources (Bluesky, Mastodon, YouTube, X), reporting unsupported capabilities honestly instead of fabricating results
-- **Drip Growth** — recurring programme calendar with an approval-gated review queue
-- **Growth Analytics** — provider snapshots with provenance; demo figures are always labelled demo
-- **Connection Centre** — OAuth 2.0 (with PKCE where applicable) for LinkedIn, YouTube, Instagram, X, Spotify, Bluesky, Mastodon and SoundCloud
+- Command centre and Golden Hour 30/60/90-minute campaign planning
+- Gemini-backed Smart Comments drafts (human review; no automatic comment posting)
+- Community Intelligence relationship register
+- Auto-Discovery rules and live scan for supported sources
+- Drip Growth recurring programme calendar and due-task review queue
+- Growth Analytics with provenance-backed provider snapshots
+- Platform connection centre: LinkedIn, YouTube, Instagram, X, Spotify, Bluesky, Mastodon and SoundCloud
 
-## Architecture
+## Run on Windows
 
-- **Backend:** FastAPI (Python), SQLite local storage, APScheduler workers for discovery and recurring schedules
-- **Frontend:** single-page vanilla JS app served by the backend
-- **Security:** Fernet-encrypted token storage (`TOKEN_ENCRYPTION_KEY`), server-side OAuth state with expiry, secrets only in a local `.env` (never committed)
-- **Tests:** offline smoke suite covering health, provider catalogue, Gemini fail-closed behaviour, discovery-rule CRUD, schedule approval, missing-OAuth handling and encryption
-
-## Quickstart (Windows)
+Use PowerShell from the repository checkout:
 
 ```powershell
-git clone https://github.com/tapasadvisory/tapas-growth-autopilot
-cd tapas-growth-autopilot
-.\start-local.ps1   # first run creates .venv, installs deps, scaffolds .env and prints an encryption key
-# fill in .env (Gemini key + the provider apps you want), then run again
+cd growth-autopilot
+.\start-local.ps1
 ```
 
-Backend at `http://127.0.0.1:8000` · health check `/api/health` · provider status `/api/status` · per-provider setup in `INTEGRATIONS.md`.
+On the first run, the script creates a Python virtual environment, installs dependencies, copies `.env.example` to `.env` and prints a Fernet encryption key. Paste that key into `.env`, add the Gemini API key, then add the provider app credentials you intend to use. Run the script again to start the backend at `http://127.0.0.1:8000`.
 
-> Note: install `uvicorn` plain rather than `uvicorn[standard]` if your Python is very new — the optional `pyyaml` wheel can fail to build; the Autopilot runs identically without the extras.
+Open http://127.0.0.1:8000.
 
-## Honest status
+Health check: http://127.0.0.1:8000/api/health  
+Provider status: http://127.0.0.1:8000/api/status  
+Provider setup: see [INTEGRATIONS.md](INTEGRATIONS.md).
 
-This is a working internal tool released as-is, not a commercial SaaS. Some providers expose less analytics than their dashboards (e.g. Spotify's general Web API has no monthly-listener figures), and some connections require the platform's own app review. Where a metric or capability isn't available, the Autopilot says so rather than inventing it.
+## Important separation of subscriptions and API credentials
 
-## Built by
+Google AI Pro / Antigravity authentication is for the local development environment. It is not automatically a server-side Gemini API key. Create a Gemini API key in Google AI Studio and configure it in `.env`. Google offers an eligible free API tier for limited models/quotas; free-tier data handling differs from paid-tier data handling. Check the current Google API pricing and data policy before processing confidential material.
 
-**Ram Narayanan** — Transformation Leader, Architect of CHANGEReadyX™, Founder, TAPAS Advisory.
-Part of the CHANGEReadyX™ growth engine behind the *AI Transformation Failures* content series and the *CHANGEReadyX™ Insights* podcast.
+## Live vs. pending
 
-If this project is useful to you, a ⭐ helps other practitioners find it.
+- Gemini Smart Comments calls the Gemini API when `GEMINI_API_KEY` is configured.
+- Provider connections remain disconnected until the OAuth callback succeeds.
+- Bluesky public discovery can run without account authentication.
+- Live discovery adapters are implemented for Bluesky, Mastodon, YouTube and X; they require the relevant public access, API credentials or account authorization. Other provider watch rules report unsupported capabilities instead of fabricating results.
+- Analytics sync exists for connected providers where the official API exposes the metrics requested. Spotify Web API does not expose Spotify for Artists' monthly-listener dashboard.
+- A 15-minute discovery worker and minute-level recurring-schedule worker run while the backend process is open.
+- Due recurring schedules create durable review tasks. They do not publish or engage automatically.
+- Sample dashboard KPIs and the seven-day illustration remain labelled demo data; only provider snapshots are live records.
 
-## Licence
+## Privacy and security
 
-© TAPAS Advisory. Released publicly for study and adaptation with attribution — please contact TAPAS Advisory for commercial reuse.
+- The backend binds to `127.0.0.1` by default.
+- OAuth tokens are encrypted at rest with `TOKEN_ENCRYPTION_KEY`.
+- Never commit `.env`, token database files, OAuth caches, browser profiles or app secrets.
+- Do not bind to `0.0.0.0`, expose a public tunnel or deploy remotely yet. Before remote access, add private workspace authentication, CSRF/session controls, HTTPS, a secrets manager, backups and audit controls.
+- No provider passwords or secrets should be entered into the browser or ChatGPT.
+
+## Validation
+
+GitHub Actions compiles the Python backend, syntax-checks the JavaScript and runs offline smoke tests for health, provider catalogue, Gemini fail-closed behavior, discovery-rule CRUD, recurring schedule approval, missing OAuth configuration and encryption. These tests do not authenticate or make live provider API calls.
+
+## Release 1.1 — capabilities
+
+An additive service layer (`services/`) ported onto the unchanged v1 backend. No v1 route, table or behaviour was modified; Gemini-backed endpoints fail closed (HTTP 503) when `GEMINI_API_KEY` is not configured, and no service fabricates metrics — unavailable data is reported as `unconfigured`, `permission_denied` (null value) or an explicit requirement.
+
+Services:
+
+- `services/youtube_engine.py` — the 12 content pillars, Gemini title evaluation (10 ranked suggestions), YouTube Analytics retention reports (raw ratios preserved), retention-optimisation guidance, deterministic thumbnail briefs, Shorts script drafts.
+- `services/github_engine.py` — public repository statistics (no token needed), traffic metrics with honest `permission_denied`/null handling, Gemini README improvement suggestions, release launch kits with an embedded ethical-growth note (no bot stars, no exchanges).
+- `services/search_geo_engine.py` — Gemini AEO generation with Schema.org FAQPage JSON-LD; deterministic GEO entity audit of submitted text (CHANGEReadyX™ trademark check, diagnostic link, attributed-statistic heuristic); keyword research with `search_volume: null` (no volume source connected — nothing invented); canonical entity registry.
+- `services/content_studio_engine.py` — one topic in, a full cross-platform draft bundle out (stored in `content_studio_bundles`).
+- `services/cross_platform_engine.py` — platform-native drafts from source text; drafts only, never published.
+- `services/experimentation_engine.py` — two-proportion z-test (pure stdlib) for A/B growth experiments.
+- `services/approval_workflow_engine.py` — approval queue plus a tamper-evident, hash-chained audit log. A gate and a record only; it publishes nothing.
+
+New endpoints: `GET /api/dashboard/summary`, `GET /api/youtube/pillars`, `POST /api/youtube/titles/evaluate`, `POST /api/youtube/retention`, `POST /api/youtube/retention/optimize`, `POST /api/youtube/shorts/generate`, `POST /api/youtube/thumbnail/brief`, `POST /api/youtube/thumbnails/analyze`, `GET /api/youtube/videos`, `GET /api/github/stats`, `POST /api/github/audit`, `POST /api/github/launch-kit`, `POST /api/search/aeo/generate`, `POST /api/search/geo/audit`, `GET /api/search/seo/status`, `POST /api/search/keywords/research`, `GET /api/search/entities`, `POST /api/studio/generate-bundle`, `GET /api/studio/bundles`, `POST /api/crossplatform/draft`, `GET|POST /api/experiments`, `POST /api/experiments/evaluate`, `GET /api/approvals/queue`, `POST /api/approvals`, `POST /api/approvals/{id}/action`, `GET /api/audit-logs`.
+
+Optional configuration: `GITHUB_TOKEN` (public stats need no token; traffic metrics need push access). Live SEO metrics remain unavailable until a Google Search Console integration is configured — `GET /api/search/seo/status` says so rather than inventing findings.

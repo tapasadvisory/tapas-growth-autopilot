@@ -109,3 +109,7 @@ Create provider applications using the accounts you own. Copy the credentials in
 ### Private-access requirement
 
 The local backend binds to `127.0.0.1`; do not change it to `0.0.0.0`, publish a tunnel or expose it to the public internet yet. The current local MVP is not a remotely authenticated multi-user service. Before using a public HTTPS callback or remote hosting, add private workspace authentication / access proxy, CSRF protections, HTTPS, audit logging and a managed secret store. In particular, do not expose OAuth callbacks and token-status endpoints through an unprotected public tunnel.
+
+## Release 1.1 — additive endpoints
+
+The `services/` layer adds analytics and drafting endpoints on top of the connections above. Scope note: YouTube retention reporting (`POST /api/youtube/retention`) uses the connected Google account's OAuth token and requires the YouTube Analytics API with the `yt-analytics.readonly` scope (already requested by the v1 YouTube connection). GitHub statistics read the public `tapasadvisory/tapas-growth-autopilot` repository and need no token; an optional `GITHUB_TOKEN` with push access additionally enables traffic metrics — without it, traffic is reported as `unconfigured`, never estimated. Keyword research reports `search_volume: null` because no volume provider is connected. Live SEO data requires a Google Search Console API integration, which is not configured; `GET /api/search/seo/status` reports that requirement explicitly.
