@@ -35,9 +35,13 @@ class V12ReliabilityTests(unittest.TestCase):
         _TEMP.cleanup()
 
     def test_version_is_1_2_0(self):
-        self.assertEqual(server.APP_VERSION, "1.2.0")
+        # The 1.2 reliability contract: health reports the running version,
+        # uptime and scheduler jobs. The exact version literal moved on in
+        # 1.3 (pinned by test_v13_publications); here we assert >= 1.2.0.
+        major, minor, _patch = (int(p) for p in server.APP_VERSION.split("."))
+        self.assertGreaterEqual((major, minor), (1, 2))
         body = self.client.get("/api/health").json()
-        self.assertEqual(body["version"], "1.2.0")
+        self.assertEqual(body["version"], server.APP_VERSION)
         self.assertIn("uptime_seconds", body)
         self.assertIn("scheduler_jobs", body)
 

@@ -56,6 +56,19 @@ Google AI Pro / Antigravity authentication is for the local development environm
 
 GitHub Actions compiles the Python backend, syntax-checks the JavaScript and runs offline smoke tests for health, provider catalogue, Gemini fail-closed behavior, discovery-rule CRUD, recurring schedule approval, missing OAuth configuration and encryption. These tests do not authenticate or make live provider API calls.
 
+## Release 1.3 — publication detection
+
+Release 1.3 adds publication *detection* on the unchanged 1.2 spine. It ports the audited-good parts of an external "Gemini Core" starter (Substack RSS detection, the optimizer's enriched output fields, its no-promises system prompt) and rejects the rest (a parallel app and database, static-token provider auth, Google Ads / paid-promotion plumbing, `uvicorn[standard]`).
+
+- **Detectors** (`services/publication_engine.py` + server wiring) observe Ram's own publications only, through authorized routes: Substack's public RSS feed (no auth), and the existing OAuth connections for YouTube (uploads playlist via the Data API) and LinkedIn (own-posts read attempted via the REST API — LinkedIn currently refuses it because the app lacks the `r_member_social` permission; the endpoint reports `permission_denied` with that exact gap and never scrapes).
+- **Register + dedup:** detections land in a `publications` table with `UNIQUE(platform, external_id)`; repeat runs register nothing twice (verified live and in tests).
+- **Optimize + approve:** each new publication is optimized by the existing Gemini engine (fail-closed, HTTP 503 without a key) into an enriched record — title, description, keywords, hashtags, a 40–80 word answer snippet, entity map, schema and GEO recommendations, audience, hook options, CTA, **risk flags** and a **confidence score** — and queued as a *pending* item in the existing approval queue with a 72-hour expiry. Detection never publishes, posts or promotes anything; every optimization is a draft for human decision.
+- **Scheduling:** a `publication_detection` job (default every 30 minutes, `PUBLICATION_DETECTION_INTERVAL_MINUTES`) runs under the 1.2 scheduler policy — fixed id, coalesce, misfire grace, single instance.
+- **Endpoints:** `GET /api/publications`, `POST /api/publications/detect`, `POST /api/publications/analyze` (the starter's `/v1/analyze`, on this API's surface and auth model), `POST /api/publications/reoptimize`.
+- **Burst resilience:** Gemini's free tier rate-limits back-to-back optimization calls during a first-scan backfill (live on day one: roughly half of a 45-publication burst). Optimizations therefore retry once after a 20-second backoff, failures are recorded per publication (`optimization_error` on its approval) instead of being hidden, and `/api/publications/reoptimize` re-fetches source text and fills failed optimizations with pacing. The steady-state cadence (a few new publications per 30-minute cycle) stays well under the limit.
+- **Out of scope, deliberately:** Google Ads / YouTube Promote and all paid promotion (no advertiser authorization exists); cross-platform attribution beyond the existing per-provider analytics snapshots; LinkedIn detection beyond the permission-gated attempt above.
+- **Tests:** 46 offline tests (30 smoke + 7 reliability + 9 publication), each suite in its own process.
+
 ## Release 1.2 — runtime reliability
 
 Release 1.2 is a reliability release: no new growth features, and no v1/1.1 route, table or behaviour removed. It fixes the failure mode where the backend silently disappeared when its shell session, host or process ended.

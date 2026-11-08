@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -68,7 +69,7 @@ if not log.handlers:
     log.addHandler(_handler)
     log.setLevel(_logging.INFO)
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
@@ -193,6 +194,12 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at TEXT NOT NULL, stars INTEGER NOT NULL,
           forks INTEGER NOT NULL, open_issues INTEGER NOT NULL, watchers INTEGER NOT NULL,
           metrics_json TEXT NOT NULL, provenance TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS publications(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, external_id TEXT NOT NULL,
+          url TEXT NOT NULL, title TEXT, published_at TEXT, content_hash TEXT,
+          optimization_json TEXT, approval_id INTEGER, detected_at TEXT NOT NULL,
+          UNIQUE(platform, external_id)
         );
         """)
         # v1.2 migration: approval expiry. Older databases have no
@@ -745,6 +752,8 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(safe_background_schedules,"interval",minutes=1,id="schedules",replace_existing=True)
     if os.getenv("ANALYTICS_AUTO_SYNC_ENABLED","false").strip().lower() == "true":
         scheduler.add_job(safe_background_analytics,"interval",minutes=max(15,int(os.getenv("ANALYTICS_SYNC_INTERVAL_MINUTES") or "60")),id="analytics",replace_existing=True)
+    if os.getenv("PUBLICATION_DETECTION_ENABLED","true").strip().lower() == "true":
+        scheduler.add_job(safe_publication_detection,"interval",minutes=max(15,int(os.getenv("PUBLICATION_DETECTION_INTERVAL_MINUTES") or "30")),id="publication_detection",replace_existing=True)
     scheduler.start()
     missed = count_missed_schedules()
     jobs = [(j.id, str(j.next_run_time)) for j in scheduler.get_jobs()]
@@ -1160,6 +1169,7 @@ from services.gemini_client import GeminiNotConfigured, NOT_CONFIGURED_MESSAGE  
 from services.github_engine import GitHubGrowthEngine  # noqa: E402
 from services.search_geo_engine import CANONICAL_ENTITIES, SEOAEOGEOEngine, geo_audit, seo_status  # noqa: E402
 from services.youtube_engine import PILLARS, YouTubeGrowthEngine  # noqa: E402
+from services.publication_engine import content_hash as publication_content_hash, fetch_feed_text, optimize_publication, parse_rss_feed  # noqa: E402
 
 
 def _gemini_503() -> HTTPException:
@@ -1510,6 +1520,320 @@ async def experiments_evaluate(payload: ExperimentEvaluateRequest):
             details={"z_score": result["z_score"], "p_value": result["p_value"]},
         )
     return {"experiment_id": payload.experiment_id, "status": "evaluated", **result}
+
+
+# ---------------------------------------------------------------------------
+# Release 1.3 — publication detection (LinkedIn / YouTube / Substack)
+#
+# Detectors observe Ram's OWN publications only, through authorized routes:
+# Substack's public RSS feed, and the existing OAuth connections for
+# YouTube and LinkedIn. Every NEW publication is deduplicated into the
+# `publications` register (UNIQUE(platform, external_id)), optimized via
+# the Gemini engine, and queued as a PENDING approval — detection never
+# publishes, posts or promotes anything. Paid promotion is out of scope.
+# ---------------------------------------------------------------------------
+
+SUBSTACK_FEED_DEFAULT = "https://ramchangereadyx.substack.com/feed"
+
+
+async def _register_publication(pub: dict, precomputed_optimization: dict | None = None) -> dict | None:
+    """Insert one publication if new; optimize + queue approval. None if dup."""
+    if not pub.get("content_hash"):
+        pub = {**pub, "content_hash": publication_content_hash(
+            pub.get("title") or "", pub.get("text") or "", pub.get("url") or "")}
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO publications(platform,external_id,url,title,published_at,content_hash,detected_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (pub["platform"], pub["external_id"], pub["url"], pub.get("title"),
+             pub.get("published_at"), pub.get("content_hash"), iso()),
+        )
+        if cur.rowcount == 0:
+            return None
+        pub_id = cur.lastrowid
+    optimization: dict | None = precomputed_optimization
+    opt_error: str | None = None
+    if optimization is None:
+        optimization, opt_error = await _optimize_with_retry(pub)
+    with db() as conn:
+        conn.execute(
+            "UPDATE publications SET optimization_json=? WHERE id=?",
+            (json.dumps(optimization) if optimization else None, pub_id),
+        )
+        payload = {
+            "publication": {k: pub.get(k) for k in ("platform", "external_id", "url", "title", "published_at", "content_hash")},
+            "optimization": optimization,
+            "optimization_error": opt_error,
+            "channel": "organic",
+            "source": "publication-detection",
+        }
+        cur = conn.execute(
+            """INSERT INTO approval_queue(action_type,platform,title,payload_json,proposed_by,status,risk_level,created_at,expires_at)
+               VALUES(?,?,?,?,?,'pending_approval',?,?,?)""",
+            ("publication_optimization", pub["platform"],
+             f"Optimize detected publication: {(pub.get('title') or pub['external_id'])[:240]}",
+             json.dumps(payload), "publication-engine", "Medium", iso(), _approval_expires_at()),
+        )
+        approval_id = cur.lastrowid
+        conn.execute("UPDATE publications SET approval_id=? WHERE id=?", (approval_id, pub_id))
+        write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="publication.detected",
+            actor="publication-engine",
+            target_entity=f"publication:{pub['platform']}:{pub_id}",
+            outcome="pending_approval",
+            details={"approval_id": approval_id, "optimization_error": opt_error},
+        )
+    return {"id": pub_id, "platform": pub["platform"], "external_id": pub["external_id"],
+            "title": pub.get("title"), "approval_id": approval_id, "optimization_error": opt_error}
+
+
+async def _optimize_with_retry(pub: dict) -> tuple[dict | None, str | None]:
+    """Optimize once; on a transient provider error (Gemini free-tier rate
+    limits bite during detection bursts), wait and retry exactly once."""
+    try:
+        return await optimize_publication(pub), None
+    except GeminiNotConfigured:
+        return None, "gemini_not_configured"
+    except Exception:
+        pass
+    await asyncio.sleep(20)
+    try:
+        return await optimize_publication(pub), None
+    except GeminiNotConfigured:
+        return None, "gemini_not_configured"
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+async def _register_many(pubs: list[dict]) -> dict:
+    new_items = []
+    for pub in pubs:
+        registered = await _register_publication(pub)
+        if registered:
+            new_items.append(registered)
+    return {"found": len(pubs), "new": len(new_items), "new_items": new_items}
+
+
+async def detect_substack_publications(collect_only: bool = False):
+    feed_url = os.getenv("SUBSTACK_RSS_URL", "").strip() or SUBSTACK_FEED_DEFAULT
+    # One retry on a transient fetch failure (a cold egress-proxy path timed
+    # out the first live run on 8 Nov 2026 while a direct fetch took ~1s).
+    last_exc: Exception | None = None
+    for _attempt in range(2):
+        try:
+            text = await fetch_feed_text(feed_url, timeout=60.0)
+            pubs = parse_rss_feed(text)
+            return pubs if collect_only else await _register_many(pubs)
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
+
+
+async def detect_youtube_publications(collect_only: bool = False):
+    token, _conn = await access_token("youtube")
+    headers = {"Authorization": f"Bearer {token}"}
+    channel = await http_json("GET", "https://www.googleapis.com/youtube/v3/channels",
+                              headers=headers, params={"part": "contentDetails", "mine": "true"})
+    items = channel.get("items") or []
+    if not items:
+        return [] if collect_only else {"found": 0, "new": 0, "new_items": []}
+    uploads = (((items[0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
+    listing = await http_json("GET", "https://www.googleapis.com/youtube/v3/playlistItems",
+                              headers=headers, params={"part": "snippet", "playlistId": uploads, "maxResults": 25})
+    pubs = []
+    for entry in listing.get("items") or []:
+        snip = entry.get("snippet") or {}
+        video_id = ((snip.get("resourceId") or {}).get("videoId"))
+        if not video_id:
+            continue
+        title = snip.get("title") or ""
+        text = (snip.get("description") or "")[:6000]
+        pubs.append({
+            "platform": "youtube", "external_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "title": title, "text": text,
+            "published_at": snip.get("publishedAt"),
+            "content_hash": None,
+        })
+    return pubs if collect_only else await _register_many(pubs)
+
+
+async def detect_linkedin_publications() -> dict:
+    """Attempt an authorized read of Ram's own LinkedIn posts.
+
+    The connected app holds openid/profile/email/w_member_social (write).
+    Reading the member's own posts requires r_member_social, which
+    LinkedIn grants separately; until it is granted this returns
+    permission_denied with the exact gap — it never scrapes.
+    """
+    token, _conn = await access_token("linkedin")
+    headers = {"Authorization": f"Bearer {token}", "Linkedin-Version": LINKEDIN_VERSION,
+               "X-Restli-Protocol-Version": "2.0.0"}
+    profile = await http_json("GET", "https://api.linkedin.com/v2/userinfo", headers=headers)
+    member = profile.get("sub")
+    if not member:
+        raise HTTPException(502, "LinkedIn userinfo returned no member id.")
+    try:
+        data = await http_json("GET", "https://api.linkedin.com/rest/posts", headers=headers,
+                               params={"q": "author", "author": f"urn:li:person:{member}",
+                                       "count": 25, "sortBy": "CREATED"})
+    except HTTPException as exc:
+        return {"status": "permission_denied", "found": 0, "new": 0, "new_items": [],
+                "detail": f"LinkedIn posts read refused (HTTP {exc.status_code}). "
+                          "Reading own posts requires the r_member_social permission, "
+                          "which the connected app does not currently hold."}
+    pubs = []
+    for entry in data.get("elements") or []:
+        post_id = entry.get("id") or entry.get("urn") or ""
+        commentary = ((entry.get("commentary") or ""))[:6000]
+        pubs.append({
+            "platform": "linkedin", "external_id": str(post_id),
+            "url": f"https://www.linkedin.com/feed/update/{post_id}/",
+            "title": commentary[:120], "text": commentary,
+            "published_at": None, "content_hash": None,
+        })
+    return await _register_many(pubs)
+
+
+async def run_publication_detection() -> dict:
+    results: dict[str, Any] = {}
+    for name, fn in (("substack", detect_substack_publications),
+                     ("youtube", detect_youtube_publications),
+                     ("linkedin", detect_linkedin_publications)):
+        try:
+            results[name] = await fn()
+        except HTTPException as exc:
+            results[name] = {"status": "error", "found": 0, "new": 0,
+                             "detail": str(exc.detail)[:300]}
+        except Exception as exc:
+            results[name] = {"status": "error", "found": 0, "new": 0,
+                             "detail": f"{type(exc).__name__}"}
+    total_new = sum(int(r.get("new") or 0) for r in results.values())
+    # Self-healing: each cycle also fills a few optimizations that failed
+    # earlier under Gemini rate limits, spaced far enough apart (30-minute
+    # cadence) to stay under the free-tier quota.
+    heal = {"attempted": 0, "fixed": 0, "still_failing": 0}
+    try:
+        heal = await _reoptimize(3)
+    except Exception:
+        pass
+    log.info("publication_detection complete new=%s per_source=%s reoptimize=%s",
+             total_new, {k: v.get("new") for k, v in results.items()}, heal)
+    return {"sources": results, "total_new": total_new, "reoptimize": heal}
+
+
+async def safe_publication_detection():
+    try:
+        await run_publication_detection()
+    except Exception:
+        pass
+
+
+class PublicationAnalyzeRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=40)
+    external_id: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=2000)
+    title: str = Field(default="", max_length=500)
+    text: str = Field(default="", max_length=20000)
+    published_at: str | None = None
+
+
+@app.get("/api/publications")
+async def publications_list(limit: int = 50, platform: str | None = None):
+    limit = min(max(limit, 1), 200)
+    with db() as conn:
+        if platform:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM publications WHERE platform=? ORDER BY id DESC LIMIT ?", (platform, limit))]
+        else:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM publications ORDER BY id DESC LIMIT ?", (limit,))]
+    for row in rows:
+        try:
+            row["optimization"] = json.loads(row.pop("optimization_json")) if row.get("optimization_json") else None
+        except json.JSONDecodeError:
+            row["optimization"] = None
+    return {"publications": rows, "count": len(rows)}
+
+
+@app.post("/api/publications/detect")
+async def publications_detect():
+    return await run_publication_detection()
+
+
+async def _reoptimize(limit: int) -> dict:
+    """Fill optimizations that failed during a detection burst (Gemini
+    free-tier rate limits). Re-fetches source text, retries with pacing,
+    and updates both the register row and its queued approval payload."""
+    limit = min(max(limit, 1), 25)
+    fresh: dict[tuple[str, str], dict] = {}
+    for collector in (detect_substack_publications, detect_youtube_publications):
+        try:
+            for pub in await collector(collect_only=True):
+                fresh[(pub["platform"], pub["external_id"])] = pub
+        except Exception:
+            continue
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM publications WHERE optimization_json IS NULL ORDER BY id ASC LIMIT ?", (limit,))]
+    fixed = 0
+    still_failing = 0
+    for index, row in enumerate(rows):
+        if index:
+            await asyncio.sleep(6)
+        pub = fresh.get((row["platform"], row["external_id"])) or {
+            "platform": row["platform"], "external_id": row["external_id"],
+            "url": row["url"], "title": row["title"] or "", "text": "",
+            "published_at": row["published_at"],
+        }
+        optimization, opt_error = await _optimize_with_retry(pub)
+        if optimization is None:
+            still_failing += 1
+            continue
+        with db() as conn:
+            conn.execute("UPDATE publications SET optimization_json=? WHERE id=?",
+                         (json.dumps(optimization), row["id"]))
+            if row.get("approval_id"):
+                appr = conn.execute("SELECT payload_json FROM approval_queue WHERE id=?",
+                                    (row["approval_id"],)).fetchone()
+                if appr:
+                    try:
+                        payload = json.loads(appr["payload_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                    payload["optimization"] = optimization
+                    payload["optimization_error"] = None
+                    conn.execute("UPDATE approval_queue SET payload_json=? WHERE id=?",
+                                 (json.dumps(payload), row["approval_id"]))
+        fixed += 1
+    return {"attempted": len(rows), "fixed": fixed, "still_failing": still_failing}
+
+
+@app.post("/api/publications/reoptimize")
+async def publications_reoptimize(limit: int = 10):
+    return await _reoptimize(limit)
+
+
+@app.post("/api/publications/analyze")
+async def publications_analyze(payload: PublicationAnalyzeRequest):
+    if payload.platform not in ("linkedin", "youtube", "substack"):
+        raise HTTPException(400, "platform must be one of: linkedin, youtube, substack.")
+    pub = {"platform": payload.platform, "external_id": payload.external_id,
+           "url": payload.url, "title": payload.title, "text": payload.text,
+           "published_at": payload.published_at}
+    from services.publication_engine import content_hash as _hash
+    pub["content_hash"] = _hash(payload.title, payload.text, payload.url)
+    try:
+        optimization = await optimize_publication(pub)
+    except GeminiNotConfigured:
+        raise HTTPException(503, NOT_CONFIGURED_MESSAGE)
+    registered = await _register_publication(pub, precomputed_optimization=optimization)
+    if registered is None:
+        return {"status": "duplicate", "publication_id": payload.external_id,
+                "optimization": optimization}
+    return {"status": "registered", **registered, "optimization": optimization}
 
 
 @app.get("/api/approvals/queue")
