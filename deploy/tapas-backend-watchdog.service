@@ -1,0 +1,7 @@
+[Unit]
+Description=TAPAS Growth Autopilot watchdog probe (health check + restart on hang)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/hatch/workspace/tapas-backend-service/watchdog.sh

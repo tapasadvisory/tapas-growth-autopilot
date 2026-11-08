@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the TAPAS backend watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=tapas-backend-watchdog.service
+
+[Install]
+WantedBy=timers.target
