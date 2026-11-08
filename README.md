@@ -56,6 +56,18 @@ Google AI Pro / Antigravity authentication is for the local development environm
 
 GitHub Actions compiles the Python backend, syntax-checks the JavaScript and runs offline smoke tests for health, provider catalogue, Gemini fail-closed behavior, discovery-rule CRUD, recurring schedule approval, missing OAuth configuration and encryption. These tests do not authenticate or make live provider API calls.
 
+## Release 1.2 — runtime reliability
+
+Release 1.2 is a reliability release: no new growth features, and no v1/1.1 route, table or behaviour removed. It fixes the failure mode where the backend silently disappeared when its shell session, host or process ended.
+
+- **Persistent service (Linux):** the backend runs as a systemd system service (`deploy/tapas-growth-backend.service`) with `Restart=always` — it survives session logout, restarts automatically after a crash, and starts at boot. It is no longer a child of any shell.
+- **Watchdog:** a systemd timer (`deploy/tapas-backend-watchdog.timer`) probes `/api/health` every minute; two consecutive failures restart the service and write an ALERT line to the watchdog alert log. Crash recovery is systemd's job; the watchdog covers the process-alive-but-unresponsive case.
+- **Scheduler reliability:** APScheduler jobs use fixed ids with `replace_existing=True` (no duplicate registrations), `coalesce=True` and `misfire_grace_time=300` (runs missed during downtime collapse into one catch-up run instead of being dropped or duplicated), and `max_instances=1` (no overlapping executions). Schedules whose `next_run_at` passed during downtime are counted in the startup log and picked up by the one-minute schedules job — that is the defined missed-job recovery path.
+- **Observability:** `/api/health` now reports `version`, `uptime_seconds` and the live scheduler job ids; startup/shutdown are logged (journald under systemd) with the job list and missed-schedule count.
+- **Approval workflow:** pending approvals now carry an `expires_at` (default 72h, `APPROVAL_TTL_HOURS`). Deciding an expired item transitions it to `expired`, writes a tamper-evident audit entry and returns HTTP 410; `POST /api/approvals/{id}/renew` returns an expired item to `pending_approval` with a fresh expiry, also audited.
+- **Provider verification:** live OAuth refresh + analytics sync verified for LinkedIn and YouTube; Gemini generation verified live. X analytics remains limited by the account's API credit balance (HTTP 402 from X — an account state, not a backend fault).
+- **Deployment & rollback:** see `deploy/DEPLOYMENT.md` for the checklist, the VM-replacement restore script and the rollback procedure (previous release = git tag `v1.1`; code rollback is a checkout of that tag, service rollback is re-running its restore).
+
 ## Release 1.1 — capabilities
 
 An additive service layer (`services/`) ported onto the unchanged v1 backend. No v1 route, table or behaviour was modified; Gemini-backed endpoints fail closed (HTTP 503) when `GEMINI_API_KEY` is not configured, and no service fabricates metrics — unavailable data is reported as `unconfigured`, `permission_denied` (null value) or an explicit requirement.

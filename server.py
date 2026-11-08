@@ -32,6 +32,9 @@ except ImportError:  # pragma: no cover - apscheduler is a declared dependency
         def add_job(self, *args: Any, **kwargs: Any) -> None:
             return None
 
+        def get_jobs(self) -> list:
+            return []
+
         def start(self) -> None:
             self.running = False
 
@@ -56,7 +59,33 @@ FRONTEND_ORIGIN = os.getenv("TAPAS_FRONTEND_ORIGIN") or "http://127.0.0.1:8000"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION") or "v25.0"
 LINKEDIN_VERSION = os.getenv("LINKEDIN_VERSION") or "202610"
-scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+import logging as _logging
+
+log = _logging.getLogger("tapas-growth-autopilot")
+if not log.handlers:
+    _handler = _logging.StreamHandler()
+    _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(_logging.INFO)
+
+APP_VERSION = "1.2.0"
+_STARTED_AT = time.time()
+
+# v1.2 scheduler reliability policy:
+# - Fixed job ids + replace_existing=True (see lifespan) mean a job can never
+#   be registered twice, even across repeated lifespan starts.
+# - coalesce=True collapses runs missed while the process was down into ONE
+#   catch-up run instead of a burst of duplicates.
+# - misfire_grace_time=300 keeps a job eligible for that catch-up run for
+#   five minutes after its slot instead of silently dropping it.
+# - max_instances=1 prevents overlapping executions of the same job.
+# Missed-job recovery: rows in the `schedules` table whose next_run_at is in
+# the past are counted at startup (see lifespan) and are picked up by the
+# one-minute `schedules` job within a minute of recovery.
+scheduler = AsyncIOScheduler(
+    timezone="Asia/Kolkata",
+    job_defaults={"coalesce": True, "misfire_grace_time": 300, "max_instances": 1},
+)
 
 
 @contextmanager
@@ -166,6 +195,19 @@ def init_db() -> None:
           metrics_json TEXT NOT NULL, provenance TEXT NOT NULL
         );
         """)
+        # v1.2 migration: approval expiry. Older databases have no
+        # expires_at column on approval_queue; add it additively.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(approval_queue)")]
+        if "expires_at" not in cols:
+            conn.execute("ALTER TABLE approval_queue ADD COLUMN expires_at TEXT")
+
+
+# v1.2: pending approvals expire after this many hours (env-overridable).
+APPROVAL_TTL_HOURS = max(1, int(os.getenv("APPROVAL_TTL_HOURS") or "72"))
+
+
+def _approval_expires_at() -> str:
+    return iso(utc_now() + timedelta(hours=APPROVAL_TTL_HOURS))
 
 
 def cipher() -> Fernet:
@@ -678,6 +720,24 @@ async def safe_background_schedules():
         pass
 
 
+def count_missed_schedules() -> int:
+    """Schedules whose next_run_at passed while the backend was down.
+
+    They are not lost: process_due_schedules (the one-minute `schedules`
+    job) picks up every due row, so recovery completes within a minute of
+    startup. This count exists so the recovery is visible in the logs.
+    """
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM schedules WHERE next_run_at IS NOT NULL AND next_run_at < ?",
+                (iso(),),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+    except Exception:
+        return 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -686,11 +746,15 @@ async def lifespan(app: FastAPI):
     if os.getenv("ANALYTICS_AUTO_SYNC_ENABLED","false").strip().lower() == "true":
         scheduler.add_job(safe_background_analytics,"interval",minutes=max(15,int(os.getenv("ANALYTICS_SYNC_INTERVAL_MINUTES") or "60")),id="analytics",replace_existing=True)
     scheduler.start()
+    missed = count_missed_schedules()
+    jobs = [(j.id, str(j.next_run_time)) for j in scheduler.get_jobs()]
+    log.info("startup version=%s scheduler_jobs=%s missed_schedules_pending_recovery=%s", APP_VERSION, jobs, missed)
     yield
     scheduler.shutdown(wait=False)
+    log.info("shutdown version=%s", APP_VERSION)
 
 
-app=FastAPI(title="TAPAS Growth Autopilot API",version="1.1.0",lifespan=lifespan)
+app=FastAPI(title="TAPAS Growth Autopilot API",version=APP_VERSION,lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[FRONTEND_ORIGIN,"http://127.0.0.1:4173","http://localhost:4173"],allow_credentials=False,allow_methods=["GET","POST","DELETE","OPTIONS"],allow_headers=["Content-Type","Authorization","X-Tapas-Admin-Token"])
 
 @app.get("/",response_class=HTMLResponse)
@@ -713,7 +777,7 @@ async def script():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"TAPAS Growth Autopilot API","mode":"private-local","time":iso(),"gemini_configured":bool(gemini_key()),"scheduler_running":scheduler.running}
+    return {"ok":True,"service":"TAPAS Growth Autopilot API","version":APP_VERSION,"mode":"private-local","time":iso(),"uptime_seconds":round(time.time()-_STARTED_AT,1),"gemini_configured":bool(gemini_key()),"scheduler_running":scheduler.running,"scheduler_jobs":[j.id for j in scheduler.get_jobs()] if scheduler.running else []}
 
 
 @app.get("/api/status")
@@ -1195,6 +1259,11 @@ class ApprovalActionRequest(BaseModel):
     notes: str = Field(default="", max_length=2000)
 
 
+class ApprovalRenewRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    notes: str = Field(default="", max_length=2000)
+
+
 @app.get("/api/dashboard/summary")
 async def dashboard_summary():
     status_data = await status()
@@ -1461,10 +1530,10 @@ async def approvals_queue():
 async def approvals_create(payload: ApprovalCreateRequest):
     with db() as conn:
         cursor = conn.execute(
-            """INSERT INTO approval_queue(action_type,platform,title,payload_json,proposed_by,status,risk_level,created_at)
-               VALUES(?,?,?,?,?,'pending_approval',?,?)""",
+            """INSERT INTO approval_queue(action_type,platform,title,payload_json,proposed_by,status,risk_level,created_at,expires_at)
+               VALUES(?,?,?,?,?,'pending_approval',?,?,?)""",
             (payload.action_type, payload.platform, payload.title,
-             json.dumps(payload.payload), payload.proposed_by, payload.risk_level, iso()),
+             json.dumps(payload.payload), payload.proposed_by, payload.risk_level, iso(), _approval_expires_at()),
         )
         approval_id = cursor.lastrowid
         audit = write_audit_log(
@@ -1488,6 +1557,27 @@ async def approvals_action(approval_id: int, payload: ApprovalActionRequest):
     if decision not in ("approve", "reject"):
         raise HTTPException(400, "decision must be 'approve' or 'reject'.")
     new_status = "approved" if decision == "approve" else "rejected"
+    # Phase 1: expiry transition. db() rolls back when an exception escapes,
+    # so the expired status + audit row must commit on a clean exit BEFORE
+    # the 410 is raised outside the block.
+    expired = False
+    with db() as conn:
+        row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
+        if row and row["status"] == "pending_approval" and row["expires_at"] and row["expires_at"] < iso():
+            conn.execute("UPDATE approval_queue SET status='expired' WHERE id=?", (approval_id,))
+            write_audit_log(
+                conn,
+                timestamp=iso(),
+                event_type="approval.expired",
+                actor="system",
+                target_entity=f"approval:{approval_id}",
+                outcome="expired",
+                details={"expired_at": row["expires_at"]},
+            )
+            expired = True
+    if expired:
+        raise HTTPException(410, "Approval item has expired. Renew it to return it to pending_approval.")
+    # Phase 2: the decision itself.
     with db() as conn:
         row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
         if not row:
@@ -1506,6 +1596,37 @@ async def approvals_action(approval_id: int, payload: ApprovalActionRequest):
             target_entity=f"approval:{approval_id}",
             outcome=new_status,
             details={"notes": payload.notes},
+        )
+        updated = dict(conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone())
+    try:
+        updated["payload"] = json.loads(updated.pop("payload_json")) if updated.get("payload_json") else None
+    except json.JSONDecodeError:
+        updated["payload"] = None
+    return {**updated, "audit_log_id": audit["id"], "audit_checksum": audit["tamper_proof_checksum"]}
+
+
+@app.post("/api/approvals/{approval_id}/renew")
+async def approvals_renew(approval_id: int, payload: ApprovalRenewRequest):
+    """v1.2: return an expired approval to pending with a fresh expiry."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Approval item not found.")
+        if row["status"] != "expired":
+            raise HTTPException(409, f"Only an expired approval can be renewed; this item is {row['status']}.")
+        new_expiry = _approval_expires_at()
+        conn.execute(
+            "UPDATE approval_queue SET status='pending_approval',expires_at=?,decision_notes=? WHERE id=?",
+            (new_expiry, payload.notes, approval_id),
+        )
+        audit = write_audit_log(
+            conn,
+            timestamp=iso(),
+            event_type="approval.renewed",
+            actor=payload.actor,
+            target_entity=f"approval:{approval_id}",
+            outcome="pending_approval",
+            details={"new_expires_at": new_expiry, "notes": payload.notes},
         )
         updated = dict(conn.execute("SELECT * FROM approval_queue WHERE id=?", (approval_id,)).fetchone())
     try:
