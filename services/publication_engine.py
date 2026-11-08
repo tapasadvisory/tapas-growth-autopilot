@@ -11,10 +11,19 @@ policy actions, and the uvicorn[standard] requirement.
 Everything here runs on the existing spine: Gemini via
 services.gemini_client (fail-closed), persistence in the existing sqlite
 store (server.py owns the table), approvals via the existing queue.
+
+Release 1.4 adds Apple Podcasts episode detection via the public
+iTunes lookup API (no credentials). NOTE on Spotify: the podcast's
+Spotify episodes are published from the same Anchor RSS feed as Apple
+Podcasts, but Spotify-side detection waits on the parked Spotify
+connection — this VM's egress refuses Spotify's token exchange, so no
+Spotify connection is attempted from here. Apple detection covers the
+episode register in the meantime.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import xml.etree.ElementTree as ET
 from datetime import timezone
@@ -25,7 +34,7 @@ import httpx
 
 from services.gemini_client import gemini_generate_json
 
-PLATFORMS = ("linkedin", "youtube", "substack")
+PLATFORMS = ("linkedin", "youtube", "substack", "apple_podcasts")
 
 _NS = {
     "content": "http://purl.org/rss/1.0/modules/content/",
@@ -118,6 +127,60 @@ OPTIMIZATION_SCHEMA: dict[str, Any] = {
     },
     "required": ["title", "description", "answer_snippet", "risk_flags", "confidence"],
 }
+
+
+# ---------------------------------------------------------------------------
+# Apple Podcasts detection (Release 1.4)
+#
+# The show "Ram's CHANGEReadyX™ from TAPAS Advisory" (Apple show id
+# 6831708010) is listed through the public iTunes lookup API, which needs
+# no credentials. Episodes register with platform "apple_podcasts" and
+# flow through the same register → Gemini optimization → pending-approval
+# path as Substack/YouTube (server.py owns that path).
+# ---------------------------------------------------------------------------
+
+APPLE_PODCAST_SHOW_ID = 6831708010
+APPLE_LOOKUP_URL = (
+    "https://itunes.apple.com/lookup?id={show_id}&entity=podcastEpisode&limit=50"
+)
+
+
+def parse_itunes_episodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse an iTunes lookup response into publication dicts.
+
+    The response mixes one collection record (the show itself) with
+    episode records; only episodes are returned. external_id is the
+    episode's trackId, falling back to its guid — the register's
+    UNIQUE(platform, external_id) makes re-runs idempotent.
+    """
+    out: list[dict[str, Any]] = []
+    for entry in payload.get("results") or []:
+        if entry.get("wrapperType") != "podcastEpisode":
+            continue
+        external_id = entry.get("trackId") or entry.get("episodeGuid") or entry.get("guid")
+        url = entry.get("trackViewUrl") or ""
+        if external_id is None or not url:
+            continue
+        title = (entry.get("trackName") or "").strip()
+        text = _strip_html(entry.get("description") or entry.get("shortDescription") or "")[:6000]
+        out.append({
+            "platform": "apple_podcasts",
+            "external_id": str(external_id),
+            "url": url,
+            "title": title,
+            "text": text,
+            "published_at": entry.get("releaseDate"),
+            "content_hash": content_hash(title, text, url),
+        })
+    return out
+
+
+async def fetch_itunes_lookup(show_id: int = APPLE_PODCAST_SHOW_ID, timeout: float = 60.0) -> dict[str, Any]:
+    url = APPLE_LOOKUP_URL.format(show_id=show_id)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(url, headers={"User-Agent": "TAPAS-Growth-Autopilot/1.4"})
+        response.raise_for_status()
+        return json.loads(response.text)
 
 
 async def optimize_publication(pub: dict[str, Any]) -> dict[str, Any]:
