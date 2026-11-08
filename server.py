@@ -69,7 +69,7 @@ if not log.handlers:
     log.addHandler(_handler)
     log.setLevel(_logging.INFO)
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
@@ -200,6 +200,11 @@ def init_db() -> None:
           url TEXT NOT NULL, title TEXT, published_at TEXT, content_hash TEXT,
           optimization_json TEXT, approval_id INTEGER, detected_at TEXT NOT NULL,
           UNIQUE(platform, external_id)
+        );
+        CREATE TABLE IF NOT EXISTS gsc_snapshots(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, collected_at TEXT NOT NULL,
+          property TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL,
+          report_json TEXT NOT NULL
         );
         """)
         # v1.2 migration: approval expiry. Older databases have no
@@ -754,6 +759,12 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(safe_background_analytics,"interval",minutes=max(15,int(os.getenv("ANALYTICS_SYNC_INTERVAL_MINUTES") or "60")),id="analytics",replace_existing=True)
     if os.getenv("PUBLICATION_DETECTION_ENABLED","true").strip().lower() == "true":
         scheduler.add_job(safe_publication_detection,"interval",minutes=max(15,int(os.getenv("PUBLICATION_DETECTION_INTERVAL_MINUTES") or "30")),id="publication_detection",replace_existing=True)
+    if os.getenv("GSC_SYNC_ENABLED","true").strip().lower() == "true":
+        scheduler.add_job(safe_gsc_sync,"interval",minutes=max(60,int(os.getenv("GSC_SYNC_INTERVAL_MINUTES") or "1440")),id="gsc_sync",replace_existing=True)
+    # Release 1.5: the auto-publish job is always registered; the cycle
+    # itself enforces the AUTO_PUBLISH_ENABLED kill switch, so the status
+    # endpoint can report the flag honestly either way.
+    scheduler.add_job(safe_auto_publish,"interval",minutes=_autopublish_interval_minutes(),id="auto_publish",replace_existing=True)
     scheduler.start()
     missed = count_missed_schedules()
     jobs = [(j.id, str(j.next_run_time)) for j in scheduler.get_jobs()]
@@ -850,6 +861,13 @@ async def connect_start(provider: str, request: Request):
     requested_scopes=list(cfg.get("scopes",[]))
     if provider=="linkedin":
         requested_scopes.extend([x for x in os.getenv("LINKEDIN_EXTRA_SCOPES","").split() if x not in requested_scopes])
+    if provider=="youtube":
+        # Release 1.4: mirror the LinkedIn extra-scopes mechanism for the
+        # Google connection so a re-consent can add scopes (e.g. the
+        # Search Console webmasters.readonly scope for GSC) without a
+        # new OAuth flow. include_granted_scopes=true is already set for
+        # this provider below, so previously granted scopes are kept.
+        requested_scopes.extend([x for x in os.getenv("GOOGLE_EXTRA_SCOPES","").split() if x not in requested_scopes])
     params={"response_type":"code","client_id":client_id,"redirect_uri":redirect_uri,"scope":" ".join(requested_scopes),"state":state}
     if challenge:
         params.update({"code_challenge":challenge,"code_challenge_method":"S256"})
@@ -1169,7 +1187,9 @@ from services.gemini_client import GeminiNotConfigured, NOT_CONFIGURED_MESSAGE  
 from services.github_engine import GitHubGrowthEngine  # noqa: E402
 from services.search_geo_engine import CANONICAL_ENTITIES, SEOAEOGEOEngine, geo_audit, seo_status  # noqa: E402
 from services.youtube_engine import PILLARS, YouTubeGrowthEngine  # noqa: E402
-from services.publication_engine import content_hash as publication_content_hash, fetch_feed_text, optimize_publication, parse_rss_feed  # noqa: E402
+from services.publication_engine import content_hash as publication_content_hash, fetch_feed_text, fetch_itunes_lookup, optimize_publication, parse_itunes_episodes, parse_rss_feed  # noqa: E402
+from services import gsc_service  # noqa: E402
+from services import publish_engine  # noqa: E402
 
 
 def _gemini_503() -> HTTPException:
@@ -1524,13 +1544,17 @@ async def experiments_evaluate(payload: ExperimentEvaluateRequest):
 
 # ---------------------------------------------------------------------------
 # Release 1.3 — publication detection (LinkedIn / YouTube / Substack)
+# Release 1.4 — adds Apple Podcasts (public iTunes lookup, no credentials).
 #
 # Detectors observe Ram's OWN publications only, through authorized routes:
-# Substack's public RSS feed, and the existing OAuth connections for
-# YouTube and LinkedIn. Every NEW publication is deduplicated into the
-# `publications` register (UNIQUE(platform, external_id)), optimized via
-# the Gemini engine, and queued as a PENDING approval — detection never
-# publishes, posts or promotes anything. Paid promotion is out of scope.
+# Substack's public RSS feed, Apple's public lookup API, and the existing
+# OAuth connections for YouTube and LinkedIn. Every NEW publication is
+# deduplicated into the `publications` register
+# (UNIQUE(platform, external_id)), optimized via the Gemini engine, and
+# queued as a PENDING approval — detection itself never publishes, posts
+# or promotes anything. (Approved publish-type items are executed by the
+# separate Release 1.5 auto-publish worker; detection approvals are
+# informational and never execute.) Paid promotion is out of scope.
 # ---------------------------------------------------------------------------
 
 SUBSTACK_FEED_DEFAULT = "https://ramchangereadyx.substack.com/feed"
@@ -1697,11 +1721,30 @@ async def detect_linkedin_publications() -> dict:
     return await _register_many(pubs)
 
 
+async def detect_apple_podcasts(collect_only: bool = False):
+    """Apple Podcasts episodes via the public iTunes lookup API.
+
+    No credentials. Fail-soft like the other detectors: run_publication_
+    detection isolates per-source errors, and a transient fetch failure
+    is retried once here (same pattern as the Substack detector).
+    """
+    last_exc: Exception | None = None
+    for _attempt in range(2):
+        try:
+            payload = await fetch_itunes_lookup()
+            pubs = parse_itunes_episodes(payload)
+            return pubs if collect_only else await _register_many(pubs)
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
+
+
 async def run_publication_detection() -> dict:
     results: dict[str, Any] = {}
     for name, fn in (("substack", detect_substack_publications),
                      ("youtube", detect_youtube_publications),
-                     ("linkedin", detect_linkedin_publications)):
+                     ("linkedin", detect_linkedin_publications),
+                     ("apple_podcasts", detect_apple_podcasts)):
         try:
             results[name] = await fn()
         except HTTPException as exc:
@@ -1769,7 +1812,7 @@ async def _reoptimize(limit: int) -> dict:
     and updates both the register row and its queued approval payload."""
     limit = min(max(limit, 1), 25)
     fresh: dict[tuple[str, str], dict] = {}
-    for collector in (detect_substack_publications, detect_youtube_publications):
+    for collector in (detect_substack_publications, detect_youtube_publications, detect_apple_podcasts):
         try:
             for pub in await collector(collect_only=True):
                 fresh[(pub["platform"], pub["external_id"])] = pub
@@ -1818,8 +1861,8 @@ async def publications_reoptimize(limit: int = 10):
 
 @app.post("/api/publications/analyze")
 async def publications_analyze(payload: PublicationAnalyzeRequest):
-    if payload.platform not in ("linkedin", "youtube", "substack"):
-        raise HTTPException(400, "platform must be one of: linkedin, youtube, substack.")
+    if payload.platform not in ("linkedin", "youtube", "substack", "apple_podcasts"):
+        raise HTTPException(400, "platform must be one of: linkedin, youtube, substack, apple_podcasts.")
     pub = {"platform": payload.platform, "external_id": payload.external_id,
            "url": payload.url, "title": payload.title, "text": payload.text,
            "published_at": payload.published_at}
@@ -1834,6 +1877,111 @@ async def publications_analyze(payload: PublicationAnalyzeRequest):
         return {"status": "duplicate", "publication_id": payload.external_id,
                 "optimization": optimization}
     return {"status": "registered", **registered, "optimization": optimization}
+
+
+# ---------------------------------------------------------------------------
+# Release 1.4 — Google Search Console (live data, fail-closed)
+#
+# Rides the existing Google ("youtube") connection in the encrypted token
+# store; no new OAuth flow. Until that connection's granted scopes include
+# https://www.googleapis.com/auth/webmasters.readonly, every endpoint
+# reports not_configured with the exact gap and the re-consent path
+# (services/gsc_service.RECONSENT). When configured, a daily scheduler
+# job and POST /api/gsc/sync pull the last 28 days of searchAnalytics
+# (dimensions query + page) into gsc_snapshots. Metrics are never
+# fabricated: a report exists only after a real API response.
+# ---------------------------------------------------------------------------
+
+def _gsc_property() -> str:
+    return os.getenv("GSC_PROPERTY_URL", "").strip() or gsc_service.DEFAULT_PROPERTY
+
+
+def _gsc_status_payload() -> dict:
+    payload = {**gsc_service.gsc_configuration(get_connection("youtube")),
+               "property": _gsc_property()}
+    with db() as conn:
+        row = conn.execute(
+            "SELECT collected_at, period_start, period_end FROM gsc_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    payload["last_sync_at"] = row["collected_at"] if row else None
+    payload["last_period"] = ({"start": row["period_start"], "end": row["period_end"]}
+                              if row else None)
+    return payload
+
+
+async def run_gsc_sync() -> dict:
+    status = _gsc_status_payload()
+    if not status["configured"]:
+        return {**status, "synced": False}
+    prop = _gsc_property()
+    token, _conn = await access_token("youtube")
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        sites = await http_json("GET", f"{gsc_service.GSC_API_BASE}/sites", headers=headers)
+    except HTTPException as exc:
+        return {"status": "error", "configured": True, "synced": False, "property": prop,
+                "detail": f"Search Console sites list refused (HTTP {exc.status_code})."}
+    available = [e.get("siteUrl") for e in sites.get("siteEntry") or []]
+    if prop not in available:
+        return {"status": "property_not_found", "configured": True, "synced": False,
+                "property": prop, "available_properties": available,
+                "detail": "The connected Google account does not hold the target property."}
+    end = utc_now().date()
+    start = end - timedelta(days=gsc_service.PERIOD_DAYS - 1)
+    body = gsc_service.build_search_analytics_body(start.isoformat(), end.isoformat())
+    encoded = urllib.parse.quote(prop, safe="")
+    try:
+        data = await http_json("POST",
+                               f"{gsc_service.GSC_API_BASE}/sites/{encoded}/searchAnalytics/query",
+                               headers=headers, json_body=body)
+    except HTTPException as exc:
+        return {"status": "error", "configured": True, "synced": False, "property": prop,
+                "detail": f"Search Analytics query refused (HTTP {exc.status_code})."}
+    snapshot = {"property": prop,
+                "period_start": start.isoformat(), "period_end": end.isoformat(),
+                "collected_at": iso(),
+                "provenance": "Google Search Console API (webmasters v3)",
+                **gsc_service.normalize_search_analytics(data)}
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO gsc_snapshots(collected_at,property,period_start,period_end,report_json) VALUES(?,?,?,?,?)",
+            (snapshot["collected_at"], prop, snapshot["period_start"],
+             snapshot["period_end"], json.dumps(snapshot)))
+    log.info("gsc_sync complete property=%s rows=%s clicks=%s impressions=%s",
+             prop, snapshot["totals"]["rows"], snapshot["totals"]["clicks"],
+             snapshot["totals"]["impressions"])
+    return {"status": "synced", "configured": True, "synced": True, **snapshot}
+
+
+async def safe_gsc_sync():
+    try:
+        await run_gsc_sync()
+    except Exception:
+        pass
+
+
+@app.get("/api/gsc/status")
+async def gsc_status():
+    return _gsc_status_payload()
+
+
+@app.post("/api/gsc/sync")
+async def gsc_sync():
+    return await run_gsc_sync()
+
+
+@app.get("/api/gsc/report")
+async def gsc_report():
+    with db() as conn:
+        row = conn.execute(
+            "SELECT report_json FROM gsc_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        payload = _gsc_status_payload()
+        # Keep both facts visible without a key collision: the report has
+        # no data yet, and the configuration verdict rides alongside.
+        payload["configuration_status"] = payload.pop("status")
+        return {"status": "no_data", **payload}
+    return {"status": "ok", **json.loads(row["report_json"])}
 
 
 @app.get("/api/approvals/queue")
@@ -1958,6 +2106,304 @@ async def approvals_renew(approval_id: int, payload: ApprovalRenewRequest):
     except json.JSONDecodeError:
         updated["payload"] = None
     return {**updated, "audit_log_id": audit["id"], "audit_checksum": audit["tamper_proof_checksum"]}
+
+
+# ---------------------------------------------------------------------------
+# Release 1.5 — auto-publish execution layer
+#
+# Ram's decision (8 Nov 2026): "Go further — auto-publish approved queues
+# without me." The property: NOTHING publishes without approval; APPROVED
+# items publish automatically. Policy lives in services/publish_engine:
+# only status="approved", unexpired, action_type="publish_post" items
+# with extractable post text may execute. publication_optimization
+# approvals are informational and NEVER execute. Each item is claimed
+# atomically (approved -> executing) before any provider call, so it
+# executes at most once per claim; every attempt — success, failure,
+# blocked, expired — writes a tamper-evident audit entry. Kill switch:
+# AUTO_PUBLISH_ENABLED (default true); AUTO_PUBLISH_DRY_RUN (default
+# false) simulates provider calls for the live routes only — blocked
+# providers stay blocked in dry-run too.
+# ---------------------------------------------------------------------------
+
+_LAST_AUTOPUBLISH_CYCLE: dict[str, Any] = {}
+
+
+def _autopublish_interval_minutes() -> int:
+    try:
+        return max(1, int(os.getenv("AUTO_PUBLISH_INTERVAL_MINUTES") or publish_engine.DEFAULT_INTERVAL_MINUTES))
+    except ValueError:
+        return publish_engine.DEFAULT_INTERVAL_MINUTES
+
+
+def _autopublish_readiness() -> dict:
+    with db() as conn:
+        conns = {r["provider"]: dict(r) for r in conn.execute(
+            "SELECT provider,status,scopes FROM connections")}
+    return publish_engine.provider_readiness(
+        conns,
+        bluesky_handle=bool(os.getenv("BLUESKY_HANDLE", "").strip()),
+        bluesky_app_password=bool(os.getenv("BLUESKY_APP_PASSWORD", "").strip()),
+    )
+
+
+async def _publish_linkedin(text: str) -> dict:
+    token, _conn = await access_token("linkedin")
+    headers = {"Authorization": f"Bearer {token}", "Linkedin-Version": LINKEDIN_VERSION,
+               "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"}
+    profile = await http_json("GET", "https://api.linkedin.com/v2/userinfo", headers=headers)
+    member = profile.get("sub")
+    if not member:
+        raise HTTPException(502, "LinkedIn userinfo returned no member id.")
+    body = {"author": f"urn:li:person:{member}", "commentary": text, "visibility": "PUBLIC",
+            "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [],
+                             "thirdPartyDistributionChannels": []},
+            "lifecycleState": "PUBLISHED", "isReshareDisabledByAuthor": False}
+    # http_json discards response headers; the post URN arrives in the
+    # x-restli-id header, so this call uses httpx directly.
+    async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
+        resp = await client.post("https://api.linkedin.com/rest/posts", headers=headers, json=body)
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code,
+                            f"LinkedIn posts create refused (HTTP {resp.status_code}): {resp.text[:300]}")
+    post_urn = resp.headers.get("x-restli-id") or ""
+    return {"post_id": post_urn or None,
+            "url": f"https://www.linkedin.com/feed/update/{post_urn}/" if post_urn else None}
+
+
+async def _publish_x(text: str) -> dict:
+    token, conn = await access_token("x")
+    data = await http_json("POST", "https://api.x.com/2/tweets",
+                           headers={"Authorization": f"Bearer {token}"}, json_body={"text": text})
+    d = data.get("data") or {}
+    post_id = d.get("id")
+    username = None
+    try:
+        username = (json.loads(conn.get("metadata_json") or "{}") or {}).get("username")
+    except (json.JSONDecodeError, TypeError):
+        username = None
+    if post_id and username:
+        url = f"https://x.com/{username}/status/{post_id}"
+    elif post_id:
+        url = f"https://x.com/i/web/status/{post_id}"
+    else:
+        url = None
+    return {"post_id": post_id, "url": url}
+
+
+async def _publish_bluesky(text: str) -> dict:
+    handle = os.getenv("BLUESKY_HANDLE", "").strip()
+    password = os.getenv("BLUESKY_APP_PASSWORD", "").strip()
+    if not handle or not password:
+        raise HTTPException(409, "Bluesky posting credential is not configured (BLUESKY_APP_PASSWORD).")
+    async with httpx.AsyncClient(timeout=35) as client:
+        s = await client.post("https://bsky.social/xrpc/com.atproto.server.createSession",
+                              json={"identifier": handle, "password": password})
+        if s.status_code >= 400:
+            raise HTTPException(s.status_code, f"Bluesky session refused (HTTP {s.status_code}).")
+        session = s.json()
+        record = {"$type": "app.bsky.feed.post", "text": text, "createdAt": iso()}
+        r = await client.post("https://bsky.social/xrpc/com.atproto.repo.createRecord",
+                              headers={"Authorization": f"Bearer {session.get('accessJwt')}"},
+                              json={"repo": session.get("did"), "collection": "app.bsky.feed.post",
+                                    "record": record})
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"Bluesky createRecord refused (HTTP {r.status_code}).")
+        out = r.json()
+    uri = out.get("uri") or ""
+    rkey = uri.rsplit("/", 1)[-1] if uri else ""
+    return {"post_id": uri or None,
+            "url": f"https://bsky.app/profile/{handle}/post/{rkey}" if rkey else None}
+
+
+async def _publish_via_provider(provider: str, text: str) -> dict:
+    """The provider-call seam. Tests monkeypatch this function."""
+    if provider == "linkedin":
+        return await _publish_linkedin(text)
+    if provider == "x":
+        return await _publish_x(text)
+    if provider == "bluesky":
+        return await _publish_bluesky(text)
+    raise HTTPException(422, f"No live publishing route for provider '{provider}'.")
+
+
+def _claim_approval(approval_id: int) -> bool:
+    """Atomically claim an approved item. True only for the one claimer."""
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE approval_queue SET status='executing' WHERE id=? AND status='approved'",
+            (approval_id,))
+        return cur.rowcount == 1
+
+
+def _record_execution(approval_id: int, new_status: str, execution: dict,
+                      event_type: str, outcome: str, details: dict) -> None:
+    with db() as conn:
+        row = conn.execute("SELECT payload_json FROM approval_queue WHERE id=?",
+                           (approval_id,)).fetchone()
+        payload: dict = {}
+        if row and row["payload_json"]:
+            try:
+                payload = json.loads(row["payload_json"]) or {}
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["execution"] = execution
+        conn.execute("UPDATE approval_queue SET status=?,payload_json=? WHERE id=?",
+                     (new_status, json.dumps(payload), approval_id))
+        write_audit_log(conn, timestamp=iso(), event_type=event_type,
+                        actor="auto-publish-worker",
+                        target_entity=f"approval:{approval_id}",
+                        outcome=outcome, details=details)
+
+
+async def _process_approved_item(row: dict, readiness: dict, dry_run: bool) -> str:
+    approval_id = row["id"]
+    # Expired approvals never execute: retire + audit, once.
+    if row.get("expires_at") and row["expires_at"] < iso():
+        with db() as conn:
+            cur = conn.execute(
+                "UPDATE approval_queue SET status='expired' WHERE id=? AND status='approved'",
+                (approval_id,))
+            if cur.rowcount == 1:
+                write_audit_log(conn, timestamp=iso(), event_type="autopublish.expired",
+                                actor="auto-publish-worker",
+                                target_entity=f"approval:{approval_id}",
+                                outcome="expired",
+                                details={"expired_at": row["expires_at"]})
+                return "expired"
+        return "skipped"
+    payload: Any = None
+    try:
+        payload = json.loads(row["payload_json"]) if row.get("payload_json") else None
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    classified = publish_engine.classify_item(row.get("action_type") or "",
+                                              row.get("platform") or "", payload)
+    if classified["kind"] != "publish":
+        # informational / other / publish-without-text: never attempted.
+        return "skipped"
+    execution = payload.get("execution") if isinstance(payload, dict) else None
+    if not isinstance(execution, dict):
+        execution = {}
+    next_attempt_at = execution.get("next_attempt_at")
+    if next_attempt_at and next_attempt_at > iso():
+        return "skipped"  # still backing off from the last failure
+    attempts_done = int(execution.get("attempts") or 0)
+    provider = (row.get("platform") or "").strip().lower()
+    entry = readiness.get(provider)
+    if entry is None:
+        entry = {"status": "blocked",
+                 "reason": f"unknown_provider: no publishing route for '{provider}'."}
+    if entry["status"] == "blocked":
+        if not _claim_approval(approval_id):
+            return "skipped"
+        _record_execution(
+            approval_id, publish_engine.STATUS_BLOCKED,
+            {"status": publish_engine.STATUS_BLOCKED, "provider": provider,
+             "reason": entry["reason"], "attempts": attempts_done, "blocked_at": iso(),
+             "dry_run": dry_run},
+            "autopublish.blocked", publish_engine.STATUS_BLOCKED,
+            {"provider": provider, "reason": entry["reason"], "dry_run": dry_run})
+        return "blocked_scope"
+    if not _claim_approval(approval_id):
+        return "skipped"
+    attempts = attempts_done + 1
+    text = classified["text"]
+    try:
+        if dry_run:
+            result = {"post_id": f"dry-run-{approval_id}", "url": None, "dry_run": True}
+        else:
+            result = await _publish_via_provider(provider, text)
+    except HTTPException as exc:
+        error = f"HTTP {exc.status_code}: {str(exc.detail)[:300]}"
+    except Exception as exc:  # noqa: BLE001 - every failure must be audited, none may kill the cycle
+        error = f"{type(exc).__name__}: {str(exc)[:300]}"
+    else:
+        error = None
+    if error is None:
+        _record_execution(
+            approval_id, publish_engine.STATUS_EXECUTED,
+            {"status": publish_engine.STATUS_EXECUTED, "provider": provider,
+             "post_id": result.get("post_id"), "url": result.get("url"),
+             "attempts": attempts, "executed_at": iso(), "dry_run": dry_run},
+            "autopublish.executed", publish_engine.STATUS_EXECUTED,
+            {"provider": provider, "post_id": result.get("post_id"),
+             "url": result.get("url"), "attempts": attempts, "dry_run": dry_run})
+        return "executed"
+    if attempts >= publish_engine.max_attempts():
+        _record_execution(
+            approval_id, publish_engine.STATUS_FAILED,
+            {"status": publish_engine.STATUS_FAILED, "provider": provider,
+             "attempts": attempts, "last_error": error, "failed_at": iso(),
+             "dry_run": dry_run},
+            "autopublish.failed", publish_engine.STATUS_FAILED,
+            {"provider": provider, "attempts": attempts, "error": error, "dry_run": dry_run})
+        return "failed"
+    retry_at = iso(utc_now() + timedelta(seconds=publish_engine.backoff_seconds(attempts)))
+    _record_execution(
+        approval_id, "approved",
+        {"status": "retry_scheduled", "provider": provider, "attempts": attempts,
+         "last_error": error, "next_attempt_at": retry_at, "dry_run": dry_run},
+        "autopublish.attempt_failed", "retry_scheduled",
+        {"provider": provider, "attempts": attempts, "error": error,
+         "next_attempt_at": retry_at, "dry_run": dry_run})
+    return "retry_scheduled"
+
+
+async def run_auto_publish_cycle() -> dict:
+    global _LAST_AUTOPUBLISH_CYCLE
+    summary: dict[str, Any] = {
+        "ran_at": iso(), "enabled": publish_engine.auto_publish_enabled(),
+        "dry_run": publish_engine.auto_publish_dry_run(),
+        "executed": 0, "blocked_scope": 0, "failed": 0, "retry_scheduled": 0,
+        "expired": 0, "skipped": 0,
+    }
+    if not summary["enabled"]:
+        summary["status"] = "disabled"
+        _LAST_AUTOPUBLISH_CYCLE = summary
+        return summary
+    readiness = _autopublish_readiness()
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM approval_queue WHERE status='approved' ORDER BY id ASC LIMIT 25")]
+    for row in rows:
+        outcome = await _process_approved_item(row, readiness, summary["dry_run"])
+        if outcome in summary:
+            summary[outcome] += 1
+        else:
+            summary["skipped"] += 1
+    summary["status"] = "ok"
+    _LAST_AUTOPUBLISH_CYCLE = summary
+    log.info("auto_publish cycle executed=%s blocked=%s failed=%s retries=%s expired=%s skipped=%s dry_run=%s",
+             summary["executed"], summary["blocked_scope"], summary["failed"],
+             summary["retry_scheduled"], summary["expired"], summary["skipped"],
+             summary["dry_run"])
+    return summary
+
+
+async def safe_auto_publish():
+    try:
+        await run_auto_publish_cycle()
+    except Exception:
+        pass
+
+
+@app.get("/api/autopublish/status")
+async def autopublish_status():
+    with db() as conn:
+        counts = {r["status"]: r["n"] for r in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM approval_queue WHERE action_type=? GROUP BY status",
+            (publish_engine.PUBLISH_ACTION_TYPE,))}
+    return {
+        "enabled": publish_engine.auto_publish_enabled(),
+        "dry_run": publish_engine.auto_publish_dry_run(),
+        "interval_minutes": _autopublish_interval_minutes(),
+        "max_attempts": publish_engine.max_attempts(),
+        "providers": _autopublish_readiness(),
+        "publish_items_by_status": counts,
+        "last_cycle": _LAST_AUTOPUBLISH_CYCLE,
+    }
 
 
 @app.get("/api/audit-logs")

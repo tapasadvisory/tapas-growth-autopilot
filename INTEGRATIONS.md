@@ -49,7 +49,7 @@ Use the identical URL in `TAPAS_BASE_URL` and the provider's developer console. 
 ## Background jobs
 
 - Discovery rules are scanned every `DISCOVERY_INTERVAL_MINUTES` minutes while the backend process is running. Implemented sources are Bluesky public post search, Mastodon instance search, YouTube video search, X recent-post search, Spotify catalog search and SoundCloud track search. LinkedIn and Instagram keyword search are not enabled in this version; their rules return an explicit unsupported capability rather than fake results.
-- Recurring schedules are checked every minute. Due entries create durable review tasks and advance the cadence. They do not auto-publish. Actual publishing needs an explicit platform-specific approved route and a separate approval step.
+- Recurring schedules are checked every minute. Due entries create durable review tasks and advance the cadence. Schedules themselves do not publish. Publishing runs through the approval queue: from Release 1.5, an item approved as a `publish_post` is executed automatically by the auto-publish worker (see README, Release 1.5) — approval is the publishing decision; nothing unapproved ever publishes.
 - Background workers run only while this local backend process remains open. Analytics polling is opt-in: set `ANALYTICS_AUTO_SYNC_ENABLED=true` and choose `ANALYTICS_SYNC_INTERVAL_MINUTES` (minimum 15) after reviewing the provider's API quota/cost. It is disabled by default. A production deployment needs a persistent worker/queue and monitoring.
 
 ## API

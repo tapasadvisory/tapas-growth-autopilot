@@ -75,8 +75,13 @@ class V13PublicationTests(unittest.TestCase):
         _TEMP.cleanup()
 
     def test_version_is_1_3_0(self):
-        self.assertEqual(server.APP_VERSION, "1.3.0")
-        self.assertEqual(self.client.get("/api/health").json()["version"], "1.3.0")
+        # The 1.3 publication contract: health reports the running
+        # version. The exact version literal moved on in 1.4 (pinned by
+        # test_v14_gsc_apple); here we assert >= 1.3.0, mirroring how this
+        # suite's predecessor relaxed the 1.2 pin when 1.3 shipped.
+        major, minor, _patch = (int(p) for p in server.APP_VERSION.split("."))
+        self.assertGreaterEqual((major, minor), (1, 3))
+        self.assertEqual(self.client.get("/api/health").json()["version"], server.APP_VERSION)
 
     def test_detection_job_registered_with_reliability_policy(self):
         ids = [j.id for j in server.scheduler.get_jobs()]
