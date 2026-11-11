@@ -6,7 +6,7 @@ TAPAS Advisory's local-first Growth Autopilot. It is a private internal workspac
 
 **Why AI layoffs announced before value arrives cost more than they save.** The latest CHANGEReadyX™ analysis breaks down the pattern — and what readiness-first leaders do instead.
 
-- Read the post on LinkedIn: https://www.linkedin.com/feed/update/urn:li:activity/7526156595622264832/
+- Read the post on LinkedIn: https://www.linkedin.com/feed/update/urn:li:activity/7526156595622264832
 - Run the CHANGEReadyX™ readiness diagnostic: https://tapasadvisory.com/diagnostic
 
 ## Modules
