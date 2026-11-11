@@ -56,6 +56,17 @@ Google AI Pro / Antigravity authentication is for the local development environm
 
 GitHub Actions compiles the Python backend, syntax-checks the JavaScript and runs offline smoke tests for health, provider catalogue, Gemini fail-closed behavior, discovery-rule CRUD, recurring schedule approval, missing OAuth configuration and encryption. These tests do not authenticate or make live provider API calls.
 
+## Release 1.6 — publishing growth integrations
+
+Release 1.6 is the integration foundation for publishing growth: a provider capability registry, YouTube view-target reporting, a publication campaign planner, and an engagement-intelligence webhook. It was merged after a line-by-line audit and its four required fixes. The runtime now reports version `1.6.0`.
+
+- **Provider capability registry** (`services/provider_integrations_v16.py`) — a fail-closed validator. A provider is never reported connected on credential presence alone: `connected: False` is hard-coded, and configured credentials yield `configured_unverified` at most. vidIQ and TubeBuddy actions are always refused until a vendor API contract exists. ConnectSafely comment/reaction actions return human-review mode only. The registry is library code: it ships no provider adapters, makes no HTTP calls, and is not wired into `server.py`.
+- **YouTube 5,000-view targets** (`services/youtube_growth_targets.py`) — reporting arithmetic over source-reported YouTube view counts only. Missing metrics report `awaiting_metrics`; no estimate is ever substituted. 5,000 views is a campaign target, not a guaranteed outcome.
+- **Publication campaign planner** (`services/publication_orchestrator_v16.py`) — a pure planner with no I/O. Every distribution task it creates is `queued_for_approval`; comment, reaction and share tasks go to a human-review queue; paid promotion is plan-only and still requires spend approval.
+- **Engagement Intelligence webhook** (`services/engagement_intelligence_engine.py` + a hook in `server.py`) — the one active behaviour in this release. After a successful *approved* publication, the auto-publish worker can dispatch an HMAC-SHA256-signed, minimal-payload `post.published`-style event to an operator-owned endpoint. It is opt-in and **off by default** (it does nothing unless `ENGAGEMENT_INTELLIGENCE_ENABLED=true` plus a webhook URL and secret are configured), and dispatch is failure-isolated: it can never block, undo or retry a publication.
+- **What this release does not activate.** YouTube upload: no upload code exists in this release, and the Google connection lacks the `youtube.upload` scope — uploading needs the maintainer's OAuth re-consent first. LinkedIn organisation publishing has no code or scopes here. ConnectSafely, MagicPost and Supergrow have no adapters, so nothing dispatches to them. The engagement webhook stays inert until an endpoint and secret are configured.
+- **Tests:** 94 offline tests (30 smoke + 7 reliability + 9 publication + 14 GSC/Apple + 13 auto-publish + 3 publication-event webhook + 7 v1.6 integrations + 6 engagement intelligence + 5 publication orchestrator), each suite in its own process.
+
 ## Release 1.5 — auto-publish execution layer
 
 Release 1.5 changes exactly one property of the system, on Ram's explicit decision (8 Nov 2026): **nothing publishes without approval — and approved items now publish automatically.** The approval gate is unchanged and absolute:
