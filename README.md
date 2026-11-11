@@ -2,6 +2,13 @@
 
 TAPAS Advisory's local-first Growth Autopilot. It is a private internal workspace, not a SaaS service for sale.
 
+## Featured — The Layoff Paradox (latest analysis)
+
+**Why AI layoffs announced before value arrives cost more than they save.** The latest CHANGEReadyX™ analysis breaks down the pattern — and what readiness-first leaders do instead.
+
+- Read the post on LinkedIn: https://www.linkedin.com/feed/update/urn:li:activity/7526156595622264832/
+- Run the CHANGEReadyX™ readiness diagnostic: https://tapasadvisory.com/diagnostic
+
 ## Modules
 
 - Command centre and Golden Hour 30/60/90-minute campaign planning
