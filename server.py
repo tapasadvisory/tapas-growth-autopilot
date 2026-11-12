@@ -72,7 +72,7 @@ if not log.handlers:
 from services.publication_event_webhook import dispatch_publication_event  # noqa: E402
 from services.engagement_intelligence_engine import dispatch_engagement_intelligence  # noqa: E402
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
