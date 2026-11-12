@@ -1,0 +1,113 @@
+{
+  "name": "TAPAS REA - Publishing and Analytics Monitor (Read Only)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "schedule-tapas-rea",
+      "name": "Every 30 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -620,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://127.0.0.1:8000/api/autopublish/status",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "read-publish",
+      "name": "Read publication status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -370,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://127.0.0.1:8000/api/analytics/snapshots",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "read-metrics",
+      "name": "Read analytics snapshots",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -120,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const status = $(\"Read publication status\").first().json;\nconst analytics = $(\"Read analytics snapshots\").first().json;\nconst entries = Array.isArray(analytics.snapshots) ? analytics.snapshots : [];\nconst providers = status.providers || {};\nconst blocked = Object.entries(providers).filter(([,value]) => value && value.status === \"blocked\").map(([key]) => key);\nreturn [{json:{schema_version:1, collected_at:new Date().toISOString(), publishing:{enabled:!!status.enabled, dry_run:!!status.dry_run, blocked_providers:blocked, queue:status.publish_items_by_status||{}, last_cycle:status.last_cycle||{}}, analytics:{snapshot_count:entries.length, provider_reported_metrics:entries.length ? \"inspect_snapshot_sources\" : \"no_data\", snapshots:entries.slice(0,20)}, warning:\"Publication status and stored snapshots are not evidence of increased organic views. Confirm each metric source.\"}}];"
+      },
+      "id": "build-observation",
+      "name": "Create REA observation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        140,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 minutes": {
+      "main": [
+        [
+          {
+            "node": "Read publication status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read publication status": {
+      "main": [
+        [
+          {
+            "node": "Read analytics snapshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read analytics snapshots": {
+      "main": [
+        [
+          {
+            "node": "Create REA observation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
