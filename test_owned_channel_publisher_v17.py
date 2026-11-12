@@ -68,6 +68,8 @@ class OwnedChannelTests(unittest.TestCase):
         calls = []
         def mocked(request):
             calls.append(request.url.path)
+            if request.method == "GET":
+                return httpx.Response(200, json={"status_code": "FINISHED"})
             return httpx.Response(200, json={"id": "1234"})
         async def go():
             async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
@@ -109,6 +111,151 @@ class OwnedChannelTests(unittest.TestCase):
                 await publish_owned(c, "unknown", "token", "id", "body", {})
         with self.assertRaises(PublishConfigurationError):
             self.run_async(go())
+
+    def test_instagram_polls_until_finished(self):
+        calls = []
+        state = {"polls": 0}
+        def mocked(request):
+            calls.append((request.method, request.url.path))
+            if request.method == "GET":
+                state["polls"] += 1
+                return httpx.Response(200, json={
+                    "status_code": "IN_PROGRESS" if state["polls"] == 1 else "FINISHED"})
+            if request.url.path.endswith("media_publish"):
+                return httpx.Response(200, json={"id": "media-9"})
+            return httpx.Response(200, json={"id": "container-9"})
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                return await publish_owned(c, "instagram", "token", "123", "Image caption",
+                    {"media": {"image_url": "https://assets.tapasadvisory.com/photo.png"}})
+        env = {"TAPAS_MEDIA_HOSTS": "assets.tapasadvisory.com", "TAPAS_IG_POLL_INTERVAL_SECONDS": "0"}
+        with patch.dict(os.environ, env):
+            r = self.run_async(go())
+        self.assertEqual(r["post_id"], "media-9")
+        self.assertEqual(state["polls"], 2)
+        self.assertTrue(calls[-1][1].endswith("media_publish"))
+
+    def test_instagram_container_error_stops_publish(self):
+        published = []
+        def mocked(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"status_code": "ERROR"})
+            if request.url.path.endswith("media_publish"):
+                published.append(True)
+                return httpx.Response(200, json={"id": "x"})
+            return httpx.Response(200, json={"id": "container-err"})
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                return await publish_owned(c, "instagram", "token", "123", "Image caption",
+                    {"media": {"image_url": "https://assets.tapasadvisory.com/photo.png"}})
+        with patch.dict(os.environ, {"TAPAS_MEDIA_HOSTS": "assets.tapasadvisory.com",
+                                     "TAPAS_IG_POLL_INTERVAL_SECONDS": "0"}):
+            with self.assertRaises(PublishConfigurationError):
+                self.run_async(go())
+        self.assertEqual(published, [])
+
+    def test_youtube_resumes_after_308(self):
+        with tempfile.TemporaryDirectory() as media:
+            video = Path(media) / "test.mp4"
+            video.write_bytes(b"0123456789")
+            ranges = []
+            def mocked(req):
+                if req.method == "POST":
+                    return httpx.Response(200, headers={
+                        "Location": "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1"})
+                ranges.append(req.headers.get("Content-Range"))
+                if len(ranges) == 1:
+                    return httpx.Response(308, headers={"Range": "bytes=0-3"})
+                return httpx.Response(201, json={"id": "video-308"})
+            async def go():
+                async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                    return await publish_owned(c, "youtube", "token", "channel", "Video title",
+                                               {"media": {"video_path": str(video), "privacy": "private"}})
+            with patch.dict(os.environ, {"TAPAS_MEDIA_ROOT": media}):
+                result = self.run_async(go())
+            self.assertEqual(result["post_id"], "video-308")
+            self.assertEqual(ranges, ["bytes 0-9/10", "bytes 4-9/10"])
+
+    def test_youtube_status_query_recovers_lost_response(self):
+        with tempfile.TemporaryDirectory() as media:
+            video = Path(media) / "test.mp4"
+            video.write_bytes(b"0123456789")
+            puts = []
+            def mocked(req):
+                if req.method == "POST":
+                    return httpx.Response(200, headers={
+                        "Location": "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=1"})
+                puts.append(req.headers.get("Content-Range"))
+                if len(puts) == 1:
+                    return httpx.Response(500)
+                return httpx.Response(201, json={"id": "video-recovered"})
+            async def go():
+                async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                    return await publish_owned(c, "youtube", "token", "channel", "Video title",
+                                               {"media": {"video_path": str(video), "privacy": "private"}})
+            with patch.dict(os.environ, {"TAPAS_MEDIA_ROOT": media}):
+                result = self.run_async(go())
+            self.assertEqual(result["post_id"], "video-recovered")
+            self.assertEqual(puts, ["bytes 0-9/10", "bytes */10"])
+
+    def test_threads_retry_check_adopts_existing_post(self):
+        posts = []
+        def mocked(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "t-1", "text": "Test content"}]})
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"id": "t-new"})
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                return await publish_owned(c, "threads", "token", "456", "Test content",
+                                           {"retry_check": True})
+        r = self.run_async(go())
+        self.assertEqual(r["post_id"], "t-1")
+        self.assertTrue(r["deduplicated"])
+        self.assertEqual(posts, [])
+
+    def test_instagram_retry_check_adopts_existing_media(self):
+        posts = []
+        def mocked(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "m-1", "caption": "Image caption"}]})
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"id": "m-new"})
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                return await publish_owned(c, "instagram", "token", "123", "Image caption",
+                    {"media": {"image_url": "https://assets.tapasadvisory.com/photo.png"},
+                     "retry_check": True})
+        with patch.dict(os.environ, {"TAPAS_MEDIA_HOSTS": "assets.tapasadvisory.com"}):
+            r = self.run_async(go())
+        self.assertEqual(r["post_id"], "m-1")
+        self.assertTrue(r["deduplicated"])
+        self.assertEqual(posts, [])
+
+    def test_youtube_retry_check_adopts_existing_upload(self):
+        writes = []
+        def mocked(request):
+            if request.method in ("POST", "PUT"):
+                writes.append(request.method)
+                return httpx.Response(201, json={"id": "v-new"})
+            if "channels" in request.url.path:
+                return httpx.Response(200, json={"items": [
+                    {"contentDetails": {"relatedPlaylists": {"uploads": "PLUP"}}}]})
+            return httpx.Response(200, json={"items": [
+                {"snippet": {"title": "Video title", "resourceId": {"videoId": "v-1"}}}]})
+        with tempfile.TemporaryDirectory() as media:
+            video = Path(media) / "test.mp4"
+            video.write_bytes(b"test media")
+            async def go():
+                async with httpx.AsyncClient(transport=httpx.MockTransport(mocked)) as c:
+                    return await publish_owned(c, "youtube", "token", "channel", "Video title",
+                        {"media": {"video_path": str(video), "privacy": "private"},
+                         "retry_check": True})
+            with patch.dict(os.environ, {"TAPAS_MEDIA_ROOT": media}):
+                r = self.run_async(go())
+        self.assertEqual(r["post_id"], "v-1")
+        self.assertTrue(r["deduplicated"])
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
