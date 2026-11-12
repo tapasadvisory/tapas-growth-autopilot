@@ -14,6 +14,7 @@ from typing import Any
 SUPPORTED_CHANNELS = {
     "youtube", "spotify", "apple_podcasts", "substack", "linkedin_profile",
     "linkedin_page", "x", "instagram", "threads", "medium", "tapas_website",
+    "facebook",
 }
 HUMAN_REVIEW_ACTIONS = {"comment", "reaction", "share"}
 PAID_ACTIONS = {"paid_promotion", "boost"}

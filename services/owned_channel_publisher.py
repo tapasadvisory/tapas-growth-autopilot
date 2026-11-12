@@ -176,6 +176,55 @@ async def publish_instagram_image(client: httpx.AsyncClient, token: str,
     return {"post_id": str(published["id"]), "url": None}
 
 
+async def _recent_facebook_match(client: httpx.AsyncClient, base: str, headers: dict,
+                                 page_id: str, message: str) -> dict | None:
+    """Find an identical recent Page post (retry dedupe; fails closed)."""
+    data = await _json(await client.get(
+        f"{base}/{page_id}/posts", headers=headers,
+        params={"fields": "id,message", "limit": 25}))
+    for item in data.get("data") or []:
+        if isinstance(item, dict) and item.get("id") and str(item.get("message") or "").strip() == message.strip():
+            return {"post_id": str(item["id"]),
+                    "url": f"https://www.facebook.com/{item['id']}",
+                    "deduplicated": True}
+    return None
+
+
+async def publish_facebook_page(client: httpx.AsyncClient, token: str,
+                                page_id: str, text: str, link: str | None = None,
+                                image_url: str | None = None,
+                                retry_check: bool = False) -> dict:
+    """Publish to a Facebook Page with its Page access token (Graph API).
+
+    Feed post by default; a photo post when an approved image URL is given.
+    """
+    if not str(page_id).isdigit():
+        raise PublishConfigurationError("Facebook Page ID is unavailable")
+    base = f"https://graph.facebook.com/{GRAPH_VERSION}"
+    headers = {"Authorization": f"Bearer {token}"}
+    message = _text(text, 63206)
+    if retry_check and not image_url:
+        found = await _recent_facebook_match(client, base, headers, page_id, message)
+        if found:
+            return found
+    if image_url:
+        published = await _json(await client.post(
+            f"{base}/{page_id}/photos", headers=headers,
+            data={"url": require_media_url(image_url), "caption": message}))
+    else:
+        body: dict = {"message": message}
+        if link:
+            if not isinstance(link, str) or not link.startswith("https://") or len(link) > 2048:
+                raise PublishConfigurationError("Facebook link must be an HTTPS URL")
+            body["link"] = link
+        published = await _json(await client.post(
+            f"{base}/{page_id}/feed", headers=headers, data=body))
+    if not published.get("id"):
+        raise PublishConfigurationError("Facebook did not confirm post ID")
+    post_id = str(published.get("post_id") or published["id"])
+    return {"post_id": post_id, "url": f"https://www.facebook.com/{post_id}"}
+
+
 async def _recent_youtube_match(client: httpx.AsyncClient, headers: dict, title: str) -> dict | None:
     """Find a recent upload with the exact title (retry dedupe; fails closed)."""
     channels = await _json(await client.get(
@@ -314,6 +363,13 @@ async def publish_owned(client: httpx.AsyncClient, provider: str, token: str,
     retry_check = bool(payload.get("retry_check"))
     if provider == "threads":
         return await publish_threads(client, token, text, retry_check=retry_check)
+    if provider == "facebook":
+        fb_media = payload.get("media") or {}
+        return await publish_facebook_page(
+            client, token, account_id, text,
+            link=payload.get("link") or fb_media.get("link"),
+            image_url=fb_media.get("image_url"),
+            retry_check=retry_check)
     media = payload.get("media") or {}
     if provider == "instagram":
         return await publish_instagram_image(client, token, account_id, text, media.get("image_url", ""),

@@ -81,6 +81,7 @@ _DRAFT_KEYS = {
     "mastodon": "mastodon_post",
     "instagram": "instagram_caption",
     "threads": "threads_post",
+    "facebook": "facebook_post",
     "x": "x_thread",
 }
 
@@ -235,4 +236,12 @@ def provider_readiness(connections: Mapping[str, dict | None],
     else:
         out["threads"] = {"status": "blocked", "reason": "threads_content_publish scope or connection missing",
                           "detail": "Authorize the Threads account and publishing scope."}
+
+    facebook = connections.get("facebook")
+    if facebook and facebook.get("status") == "connected" and "pages_manage_posts" in _scopes_of(facebook):
+        out["facebook"] = {"status": "ready", "reason": None,
+                           "detail": "Authorized Facebook Page publishing via pages_manage_posts."}
+    else:
+        out["facebook"] = {"status": "blocked", "reason": "pages_manage_posts scope or connection missing",
+                           "detail": "Authorize the Facebook Page and publishing scope."}
     return out
