@@ -16,7 +16,7 @@ These are **live API call implementations** but were tested offline with mocked 
 
 Use the existing \`POST /api/approvals\` endpoint to create a \`publish_post\` proposal for one platform and the existing \`POST /api/approvals/{id}/action\` endpoint to approve it. Only **approved** items are executed by the existing auto-publish worker; the admin can inspect status using \`GET /api/autopublish/status\`. Start with \`AUTO_PUBLISH_DRY_RUN=true\` and verify readiness. Do not expose the current local-only API publicly without adding application authentication and access controls.
 
-The worker's existing retry logic can potentially duplicate publication when a provider accepts a post but the acknowledgment is lost; review this before enabling production publishing.
+Duplicate-publication protection (added on this branch after review): YouTube uploads use the resumable protocol with session-status recovery, and on any worker retry (attempt 2+) the adapters first check the account's recent posts/media/uploads for an exact match and adopt that result instead of publishing again. A retry after a lost acknowledgement therefore resolves to the original post rather than a duplicate.
 
 ## Configure provider permissions
 
@@ -32,7 +32,7 @@ Set these only on the backend, never in a repository:
 
 Add \`TAPAS_MEDIA_HOSTS\` containing the exact authorized CDN hostnames for Instagram, and \`TAPAS_MEDIA_ROOT\` as the absolute local media directory for YouTube. Never place secrets, OAuth tokens, mobile sessions or browser cookies in GitHub.
 
-The OAuth callback stores granted scopes where returned by the provider. If a provider does not expose scopes, readiness stays **blocked** rather than assuming a successful authorization. Scope verification, Instagram asynchronous processing checks, resumable upload recovery, and token expiry handling must be completed before a production rollout.
+The OAuth callback stores granted scopes where returned by the provider. If a provider does not expose scopes, readiness stays **blocked** rather than assuming a successful authorization. Also implemented on this branch after review: Instagram container status polling before media_publish, YouTube resumable-session recovery, retry dedupe checks, and the Threads long-lived token exchange (th_exchange_token at connect, th_refresh_token on refresh). Live-account validation is still required before a production rollout.
 
 ## Example: propose an owned-channel publication (DO NOT EXECUTE until reviewed)
 
@@ -41,7 +41,7 @@ The OAuth callback stores granted scopes where returned by the provider. If a pr
   "action_type": "publish_post",
   "platform": "threads",
   "title": "Approved transformation insight",
-  "payload": {"text": "CHANGEReadyX®: operational readiness before go-live."},
+  "payload": {"text": "CHANGEReadyX™: operational readiness before go-live."},
   "proposed_by": "Tapas Advisory",
   "risk_level": "Medium"
 }
