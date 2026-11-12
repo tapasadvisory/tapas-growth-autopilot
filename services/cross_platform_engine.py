@@ -24,6 +24,8 @@ Write platform-native DRAFTS (nothing will be auto-published):
 - bluesky_post: single post under 300 characters with the diagnostic link
 - mastodon_post: single post under 500 characters with the diagnostic link
 - instagram_caption: caption with line breaks and the diagnostic link (no hashtag spam; at most 5 relevant hashtags)
+- threads_post: one original Threads text post under 500 characters
+- youtube_description: search-friendly YouTube description with a clear CTA
 - podcast_metadata: title and description for a CHANGEReadyX™ Insights podcast episode on this topic
 Return JSON only matching the schema."""
         schema = {
@@ -34,6 +36,8 @@ Return JSON only matching the schema."""
                 "bluesky_post": {"type": "STRING"},
                 "mastodon_post": {"type": "STRING"},
                 "instagram_caption": {"type": "STRING"},
+                "threads_post": {"type": "STRING"},
+                "youtube_description": {"type": "STRING"},
                 "podcast_metadata": {
                     "type": "OBJECT",
                     "properties": {
@@ -45,7 +49,7 @@ Return JSON only matching the schema."""
             },
             "required": [
                 "linkedin_post", "x_thread", "bluesky_post", "mastodon_post",
-                "instagram_caption", "podcast_metadata",
+                "instagram_caption", "threads_post", "youtube_description", "podcast_metadata",
             ],
         }
         result = await gemini_generate_json(prompt, schema)

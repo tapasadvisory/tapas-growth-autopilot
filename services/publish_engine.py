@@ -80,6 +80,7 @@ _DRAFT_KEYS = {
     "bluesky": "bluesky_post",
     "mastodon": "mastodon_post",
     "instagram": "instagram_caption",
+    "threads": "threads_post",
     "x": "x_thread",
 }
 
@@ -216,4 +217,22 @@ def provider_readiness(connections: Mapping[str, dict | None],
 
     for provider, reason in STATIC_BLOCKED_REASONS.items():
         out[provider] = {"status": "blocked", "reason": reason, "detail": reason}
+
+    youtube = connections.get("youtube")
+    if youtube and youtube.get("status") == "connected" and YOUTUBE_UPLOAD_SCOPE in _scopes_of(youtube):
+        out["youtube"] = {"status": "ready", "reason": None,
+                          "detail": "Authorized uploads via youtube.upload; requires approved local video."}
+
+    instagram = connections.get("instagram")
+    if instagram and instagram.get("status") == "connected" and "instagram_business_content_publish" in _scopes_of(instagram):
+        out["instagram"] = {"status": "ready", "reason": None,
+                            "detail": "Instagram Professional image publishing via approved API."}
+
+    threads = connections.get("threads")
+    if threads and threads.get("status") == "connected" and "threads_content_publish" in _scopes_of(threads):
+        out["threads"] = {"status": "ready", "reason": None,
+                          "detail": "Authorized Threads text publishing."}
+    else:
+        out["threads"] = {"status": "blocked", "reason": "threads_content_publish scope or connection missing",
+                          "detail": "Authorize the Threads account and publishing scope."}
     return out

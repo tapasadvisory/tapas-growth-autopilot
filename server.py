@@ -272,7 +272,8 @@ def provider_readiness() -> dict[str, dict[str, Any]]:
     return {
       "linkedin": {"label":"LinkedIn","configured":bool(os.getenv("LINKEDIN_CLIENT_ID") and os.getenv("LINKEDIN_CLIENT_SECRET")),"mode":"OAuth 2.0","capability":"Member identity and permitted member posting; Page analytics require approved Community Management access and Page admin role."},
       "youtube": {"label":"YouTube","configured":bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),"mode":"Google OAuth 2.0","capability":"Channel profile and YouTube Analytics reports using granted scopes."},
-      "instagram": {"label":"Instagram","configured":bool(os.getenv("META_APP_ID") and os.getenv("META_APP_SECRET")),"mode":"Instagram Login OAuth","capability":"Professional-account profile and Insights where the account and app permissions qualify."},
+      "instagram": {"label":"Instagram","configured":bool(os.getenv("META_APP_ID") and os.getenv("META_APP_SECRET")),"mode":"Instagram Login OAuth","capability":"Professional-account profile, insights and content publishing only with approved scopes."},
+      "threads": {"label":"Threads","configured":bool(os.getenv("THREADS_APP_ID") and os.getenv("THREADS_APP_SECRET")),"mode":"Threads OAuth","capability":"Owned-profile text posting with approved Threads permissions."},
       "x": {"label":"X","configured":bool(os.getenv("X_CLIENT_ID")),"mode":"OAuth 2.0 PKCE","capability":"Authenticated profile and available post metrics; API plan and endpoint access apply."},
       "spotify": {"label":"Spotify","configured":bool(os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET")),"mode":"OAuth 2.0","capability":"Authorized listener profile and user data. Spotify for Artists monthly-listener analytics are not exposed by the general Web API."},
       "bluesky": {"label":"Bluesky","configured":True,"mode":"Public AT Protocol reads","capability":"Public post search and public author feeds; private/account actions require a separate AT Protocol authorization setup."},
@@ -298,6 +299,11 @@ OAUTH_PROVIDERS = {
   "auth":"https://www.instagram.com/oauth/authorize","token":"https://api.instagram.com/oauth/access_token",
   "client_id":"META_APP_ID","client_secret":"META_APP_SECRET",
   "scopes":["instagram_business_basic","instagram_business_manage_insights"],"pkce":False,"basic":False
+ },
+ "threads": {
+  "auth":"https://threads.net/oauth/authorize","token":"https://graph.threads.net/oauth/access_token",
+  "client_id":"THREADS_APP_ID","client_secret":"THREADS_APP_SECRET",
+  "scopes":["threads_basic","threads_content_publish"],"pkce":False,"basic":False,
  },
  "x": {
   "auth":"https://x.com/i/oauth2/authorize","token":"https://api.x.com/2/oauth2/token",
@@ -392,6 +398,9 @@ async def whoami(provider: str, access_token: str, instance: str | None = None) 
     if provider == "instagram":
         data = await http_json("GET",f"https://graph.instagram.com/{GRAPH_API_VERSION}/me",params={"fields":"user_id,username,account_type,media_count","access_token":access_token})
         return {"account_id":data.get("user_id") or data.get("id"),"display_name":data.get("username"),"profile":data}
+    if provider == "threads":
+        data = await http_json("GET","https://graph.threads.net/v1.0/me",headers=headers,params={"fields":"id,username"})
+        return {"account_id":data.get("id"),"display_name":data.get("username"),"profile":data}
     if provider == "x":
         data = await http_json("GET",OAUTH_PROVIDERS["x"]["userinfo"],headers=headers)
         user=data.get("data") or {}
@@ -431,6 +440,20 @@ def store_connection(provider: str, token: dict, identity: dict, instance: str |
 
 
 async def refresh_access_token(provider: str, connection: dict) -> dict:
+    if provider == "threads":
+        old_access=decrypt_secret(connection.get("access_token_enc"))
+        if not old_access: return connection
+        try:
+            token=await http_json("GET","https://graph.threads.net/refresh_access_token",params={"grant_type":"th_refresh_token","access_token":old_access})
+            if token.get("access_token"):
+                new_access=token["access_token"]
+                with db() as conn:
+                    conn.execute("UPDATE connections SET access_token_enc=?,expires_at=?,last_error=NULL WHERE provider=?", (encrypt_secret(new_access),int(time.time())+int(token.get("expires_in",5184000)),provider))
+                connection["access_token_enc"]=encrypt_secret(new_access)
+                connection["expires_at"]=int(time.time())+int(token.get("expires_in",5184000))
+        except HTTPException as exc:
+            with db() as conn: conn.execute("UPDATE connections SET last_error=? WHERE provider=?", (str(exc.detail)[:500],provider))
+        return connection
     if provider == "instagram":
         old_access=decrypt_secret(connection.get("access_token_enc"))
         if not old_access: return connection
@@ -864,6 +887,10 @@ async def connect_start(provider: str, request: Request):
     requested_scopes=list(cfg.get("scopes",[]))
     if provider=="linkedin":
         requested_scopes.extend([x for x in os.getenv("LINKEDIN_EXTRA_SCOPES","").split() if x not in requested_scopes])
+    if provider=="instagram":
+        requested_scopes.extend([x for x in os.getenv("META_EXTRA_SCOPES","").split() if x not in requested_scopes])
+    if provider=="x":
+        requested_scopes.extend([x for x in os.getenv("X_EXTRA_SCOPES","").split() if x not in requested_scopes])
     if provider=="youtube":
         # Release 1.4: mirror the LinkedIn extra-scopes mechanism for the
         # Google connection so a re-consent can add scopes (e.g. the
@@ -905,6 +932,14 @@ async def oauth_callback(provider: str, request: Request):
         # Exchange the short-lived token for the longer-lived Instagram Login token when supported.
         try:
             token=await http_json("GET","https://graph.instagram.com/access_token",params={"grant_type":"ig_exchange","client_secret":os.getenv("META_APP_SECRET",""),"access_token":access})
+        except Exception:
+            pass
+        access=token.get("access_token",access)
+    if provider=="threads":
+        # Exchange the short-lived Threads token (~1 hour) for a long-lived
+        # one (~60 days, refreshable via th_refresh_token) before storing.
+        try:
+            token=await http_json("GET","https://graph.threads.net/access_token",params={"grant_type":"th_exchange_token","client_secret":os.getenv("THREADS_APP_SECRET",""),"access_token":access})
         except Exception:
             pass
         access=token.get("access_token",access)
@@ -2218,8 +2253,13 @@ async def _publish_bluesky(text: str) -> dict:
             "url": f"https://bsky.app/profile/{handle}/post/{rkey}" if rkey else None}
 
 
-async def _publish_via_provider(provider: str, text: str) -> dict:
-    """The provider-call seam. Tests monkeypatch this function."""
+async def _publish_via_provider(provider: str, text: str, payload: dict | None = None) -> dict:
+    """Approved publishing seam. Extra payload used for owned media accounts."""
+    if provider in {"youtube", "instagram", "threads"}:
+        from services.owned_channel_publisher import publish_owned
+        token, connection = await access_token(provider)
+        async with httpx.AsyncClient(timeout=120, follow_redirects=False) as client:
+            return await publish_owned(client, provider, token, str(connection.get("account_id") or ""), text, payload or {})
     if provider == "linkedin":
         return await _publish_linkedin(text)
     if provider == "x":
@@ -2317,7 +2357,16 @@ async def _process_approved_item(row: dict, readiness: dict, dry_run: bool) -> s
         if dry_run:
             result = {"post_id": f"dry-run-{approval_id}", "url": None, "dry_run": True}
         else:
-            result = await _publish_via_provider(provider, text)
+            if provider in {"youtube", "instagram", "threads"}:
+                owned_payload = dict(payload) if isinstance(payload, dict) else {}
+                if attempts_done >= 1:
+                    # A retry after a failure whose provider outcome is
+                    # uncertain: adapters must check for the earlier post
+                    # before creating a duplicate.
+                    owned_payload["retry_check"] = True
+                result = await _publish_via_provider(provider, text, owned_payload)
+            else:
+                result = await _publish_via_provider(provider, text)
     except HTTPException as exc:
         error = f"HTTP {exc.status_code}: {str(exc.detail)[:300]}"
     except Exception as exc:  # noqa: BLE001 - every failure must be audited, none may kill the cycle
