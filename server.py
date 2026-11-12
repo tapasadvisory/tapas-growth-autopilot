@@ -72,7 +72,7 @@ if not log.handlers:
 from services.publication_event_webhook import dispatch_publication_event  # noqa: E402
 from services.engagement_intelligence_engine import dispatch_engagement_intelligence  # noqa: E402
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 _STARTED_AT = time.time()
 
 # v1.2 scheduler reliability policy:
@@ -274,6 +274,7 @@ def provider_readiness() -> dict[str, dict[str, Any]]:
       "youtube": {"label":"YouTube","configured":bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),"mode":"Google OAuth 2.0","capability":"Channel profile and YouTube Analytics reports using granted scopes."},
       "instagram": {"label":"Instagram","configured":bool(os.getenv("META_APP_ID") and os.getenv("META_APP_SECRET")),"mode":"Instagram Login OAuth","capability":"Professional-account profile, insights and content publishing only with approved scopes."},
       "threads": {"label":"Threads","configured":bool(os.getenv("THREADS_APP_ID") and os.getenv("THREADS_APP_SECRET")),"mode":"Threads OAuth","capability":"Owned-profile text posting with approved Threads permissions."},
+      "facebook": {"label":"Facebook Page","configured":bool(os.getenv("META_APP_ID") and os.getenv("META_APP_SECRET") and os.getenv("FACEBOOK_PAGE_ID")),"mode":"Facebook Login OAuth","capability":"Page profile, insights and content publishing only with approved scopes."},
       "x": {"label":"X","configured":bool(os.getenv("X_CLIENT_ID")),"mode":"OAuth 2.0 PKCE","capability":"Authenticated profile and available post metrics; API plan and endpoint access apply."},
       "spotify": {"label":"Spotify","configured":bool(os.getenv("SPOTIFY_CLIENT_ID") and os.getenv("SPOTIFY_CLIENT_SECRET")),"mode":"OAuth 2.0","capability":"Authorized listener profile and user data. Spotify for Artists monthly-listener analytics are not exposed by the general Web API."},
       "bluesky": {"label":"Bluesky","configured":True,"mode":"Public AT Protocol reads","capability":"Public post search and public author feeds; private/account actions require a separate AT Protocol authorization setup."},
@@ -304,6 +305,11 @@ OAUTH_PROVIDERS = {
   "auth":"https://threads.net/oauth/authorize","token":"https://graph.threads.net/oauth/access_token",
   "client_id":"THREADS_APP_ID","client_secret":"THREADS_APP_SECRET",
   "scopes":["threads_basic","threads_content_publish"],"pkce":False,"basic":False,
+ },
+ "facebook": {
+  "auth":"https://www.facebook.com/v25.0/dialog/oauth","token":"https://graph.facebook.com/v25.0/oauth/access_token",
+  "client_id":"META_APP_ID","client_secret":"META_APP_SECRET",
+  "scopes":["pages_show_list","pages_manage_posts","pages_read_engagement","read_insights"],"pkce":False,"basic":False,
  },
  "x": {
   "auth":"https://x.com/i/oauth2/authorize","token":"https://api.x.com/2/oauth2/token",
@@ -401,6 +407,15 @@ async def whoami(provider: str, access_token: str, instance: str | None = None) 
     if provider == "threads":
         data = await http_json("GET","https://graph.threads.net/v1.0/me",headers=headers,params={"fields":"id,username"})
         return {"account_id":data.get("id"),"display_name":data.get("username"),"profile":data}
+    if provider == "facebook":
+        data = await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/accounts",params={"fields":"id,name,access_token,category,fan_count","access_token":access_token})
+        pages = data.get("data") or []
+        wanted = os.getenv("FACEBOOK_PAGE_ID","").strip()
+        page = next((p for p in pages if str(p.get("id")) == wanted), pages[0] if pages else None)
+        if page:
+            return {"account_id":page.get("id"),"display_name":page.get("name"),"profile":page}
+        me = await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/me",params={"fields":"id,name","access_token":access_token})
+        return {"account_id":me.get("id"),"display_name":me.get("name"),"profile":me}
     if provider == "x":
         data = await http_json("GET",OAUTH_PROVIDERS["x"]["userinfo"],headers=headers)
         user=data.get("data") or {}
@@ -887,7 +902,7 @@ async def connect_start(provider: str, request: Request):
     requested_scopes=list(cfg.get("scopes",[]))
     if provider=="linkedin":
         requested_scopes.extend([x for x in os.getenv("LINKEDIN_EXTRA_SCOPES","").split() if x not in requested_scopes])
-    if provider=="instagram":
+    if provider in ("instagram","facebook"):
         requested_scopes.extend([x for x in os.getenv("META_EXTRA_SCOPES","").split() if x not in requested_scopes])
     if provider=="x":
         requested_scopes.extend([x for x in os.getenv("X_EXTRA_SCOPES","").split() if x not in requested_scopes])
@@ -943,6 +958,30 @@ async def oauth_callback(provider: str, request: Request):
         except Exception:
             pass
         access=token.get("access_token",access)
+    if provider=="facebook":
+        # Exchange the short-lived user token for a long-lived one, resolve
+        # the configured Page, verify the permissions Meta actually granted,
+        # and store the PAGE access token (Page tokens are what publish).
+        try:
+            long_token=await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/oauth/access_token",params={"grant_type":"fb_exchange_token","client_id":os.getenv("META_APP_ID",""),"client_secret":os.getenv("META_APP_SECRET",""),"fb_exchange_token":access})
+            if long_token.get("access_token"):
+                token=long_token; access=long_token["access_token"]
+        except Exception:
+            pass
+        identity=await whoami(provider,access,row["instance"])
+        page_token=(identity.get("profile") or {}).get("access_token")
+        if not page_token:
+            raise HTTPException(502,"Facebook did not return a Page access token for the configured Page.")
+        try:
+            perms=await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/permissions",params={"access_token":access})
+            granted=[str(p.get("permission")) for p in (perms.get("data") or []) if p.get("status")=="granted" and p.get("permission")]
+            if granted:
+                token={**token,"scope":" ".join(granted)}
+        except Exception:
+            pass
+        token={**token,"access_token":page_token,"expires_in":int(token.get("expires_in",5184000))}
+        store_connection(provider,token,identity,row["instance"])
+        return RedirectResponse("/?view=connections&connected=facebook")
     identity=await whoami(provider,access,row["instance"])
     store_connection(provider,token,identity,row["instance"])
     return RedirectResponse("/?view=connections&connected="+urllib.parse.quote(provider))
@@ -1087,6 +1126,21 @@ async def sync_instagram(token: str) -> dict:
     return {"account_id":uid,"username":profile.get("username"),"account_type":profile.get("account_type"),"media_count":profile.get("media_count"),"insights":insights,"provenance":"Instagram Graph API","note":"Insights vary by professional account type, metric availability and Meta app permissions."}
 
 
+async def sync_facebook(token: str) -> dict:
+    headers={"Authorization":f"Bearer {token}"}
+    c=get_connection("facebook") or {}
+    page_id=str(c.get("account_id") or os.getenv("FACEBOOK_PAGE_ID",""))
+    profile=await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}",headers=headers,params={"fields":"id,name,fan_count,followers_count,link"})
+    insights={}
+    for metric in ("page_post_engagements","page_impressions_unique","page_fans"):
+        try:
+            d=await http_json("GET",f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}/insights",headers=headers,params={"metric":metric,"period":"day"})
+            insights[metric]=d.get("data",[])
+        except HTTPException:
+            continue
+    return {"account_id":page_id,"page":profile.get("name"),"fan_count":profile.get("fan_count"),"followers_count":profile.get("followers_count"),"insights":insights,"provenance":"Facebook Graph API","note":"Page insights vary by metric availability and Meta app permissions (read_insights)."}
+
+
 async def sync_x(token: str) -> dict:
     profile=await http_json("GET","https://api.x.com/2/users/me",headers={"Authorization":f"Bearer {token}"},params={"user.fields":"public_metrics,created_at,description"})
     user=profile.get("data") or {}
@@ -1146,6 +1200,7 @@ async def sync_platform(provider: str) -> dict:
     token,c=await access_token(provider)
     if provider=="youtube": data=await sync_youtube(token)
     elif provider=="instagram": data=await sync_instagram(token)
+    elif provider=="facebook": data=await sync_facebook(token)
     elif provider=="x": data=await sync_x(token)
     elif provider=="spotify": data=await sync_spotify(token)
     elif provider=="linkedin": data=await sync_linkedin(token)
@@ -1192,7 +1247,7 @@ async def analytics_sync(provider: str):
     with db() as conn:
         conn.execute("INSERT INTO analytics_snapshots(provider,collected_at,metrics_json,provenance) VALUES(?,?,?,?)",
             (provider,iso(),json.dumps(data),data.get("provenance","Public provider API")))
-        if provider in ("linkedin","youtube","instagram","x","spotify","mastodon","soundcloud"):
+        if provider in ("linkedin","youtube","instagram","facebook","x","spotify","mastodon","soundcloud"):
             conn.execute("UPDATE connections SET last_sync_at=?,last_error=NULL WHERE provider=?",(iso(),provider))
     return {"provider":provider,"collected_at":iso(),"data":data}
 
@@ -2255,7 +2310,7 @@ async def _publish_bluesky(text: str) -> dict:
 
 async def _publish_via_provider(provider: str, text: str, payload: dict | None = None) -> dict:
     """Approved publishing seam. Extra payload used for owned media accounts."""
-    if provider in {"youtube", "instagram", "threads"}:
+    if provider in {"youtube", "instagram", "threads", "facebook"}:
         from services.owned_channel_publisher import publish_owned
         token, connection = await access_token(provider)
         async with httpx.AsyncClient(timeout=120, follow_redirects=False) as client:
@@ -2357,7 +2412,7 @@ async def _process_approved_item(row: dict, readiness: dict, dry_run: bool) -> s
         if dry_run:
             result = {"post_id": f"dry-run-{approval_id}", "url": None, "dry_run": True}
         else:
-            if provider in {"youtube", "instagram", "threads"}:
+            if provider in {"youtube", "instagram", "threads", "facebook"}:
                 owned_payload = dict(payload) if isinstance(payload, dict) else {}
                 if attempts_done >= 1:
                     # A retry after a failure whose provider outcome is

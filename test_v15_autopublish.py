@@ -159,8 +159,8 @@ class V15WorkerTests(_EnvGuard):
         return asyncio.run(server.run_auto_publish_cycle())
 
     def test_version_and_job(self):
-        self.assertEqual(server.APP_VERSION, "1.7.0")
-        self.assertEqual(self.client.get("/api/health").json()["version"], "1.7.0")
+        self.assertEqual(server.APP_VERSION, "1.8.0")
+        self.assertEqual(self.client.get("/api/health").json()["version"], "1.8.0")
         ids = [j.id for j in server.scheduler.get_jobs()]
         self.assertIn("auto_publish", ids)
         job = [j for j in server.scheduler.get_jobs() if j.id == "auto_publish"][0]
