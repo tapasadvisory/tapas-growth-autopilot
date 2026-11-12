@@ -440,6 +440,20 @@ def store_connection(provider: str, token: dict, identity: dict, instance: str |
 
 
 async def refresh_access_token(provider: str, connection: dict) -> dict:
+    if provider == "threads":
+        old_access=decrypt_secret(connection.get("access_token_enc"))
+        if not old_access: return connection
+        try:
+            token=await http_json("GET","https://graph.threads.net/refresh_access_token",params={"grant_type":"th_refresh_token","access_token":old_access})
+            if token.get("access_token"):
+                new_access=token["access_token"]
+                with db() as conn:
+                    conn.execute("UPDATE connections SET access_token_enc=?,expires_at=?,last_error=NULL WHERE provider=?", (encrypt_secret(new_access),int(time.time())+int(token.get("expires_in",5184000)),provider))
+                connection["access_token_enc"]=encrypt_secret(new_access)
+                connection["expires_at"]=int(time.time())+int(token.get("expires_in",5184000))
+        except HTTPException as exc:
+            with db() as conn: conn.execute("UPDATE connections SET last_error=? WHERE provider=?", (str(exc.detail)[:500],provider))
+        return connection
     if provider == "instagram":
         old_access=decrypt_secret(connection.get("access_token_enc"))
         if not old_access: return connection
@@ -918,6 +932,14 @@ async def oauth_callback(provider: str, request: Request):
         # Exchange the short-lived token for the longer-lived Instagram Login token when supported.
         try:
             token=await http_json("GET","https://graph.instagram.com/access_token",params={"grant_type":"ig_exchange","client_secret":os.getenv("META_APP_SECRET",""),"access_token":access})
+        except Exception:
+            pass
+        access=token.get("access_token",access)
+    if provider=="threads":
+        # Exchange the short-lived Threads token (~1 hour) for a long-lived
+        # one (~60 days, refreshable via th_refresh_token) before storing.
+        try:
+            token=await http_json("GET","https://graph.threads.net/access_token",params={"grant_type":"th_exchange_token","client_secret":os.getenv("THREADS_APP_SECRET",""),"access_token":access})
         except Exception:
             pass
         access=token.get("access_token",access)
@@ -2336,7 +2358,13 @@ async def _process_approved_item(row: dict, readiness: dict, dry_run: bool) -> s
             result = {"post_id": f"dry-run-{approval_id}", "url": None, "dry_run": True}
         else:
             if provider in {"youtube", "instagram", "threads"}:
-                result = await _publish_via_provider(provider, text, payload)
+                owned_payload = dict(payload) if isinstance(payload, dict) else {}
+                if attempts_done >= 1:
+                    # A retry after a failure whose provider outcome is
+                    # uncertain: adapters must check for the earlier post
+                    # before creating a duplicate.
+                    owned_payload["retry_check"] = True
+                result = await _publish_via_provider(provider, text, owned_payload)
             else:
                 result = await _publish_via_provider(provider, text)
     except HTTPException as exc:
