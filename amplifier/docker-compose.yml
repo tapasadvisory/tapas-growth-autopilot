@@ -1,0 +1,13 @@
+services:
+  content-amplifier:
+    build:
+      context: ..
+      dockerfile: amplifier/Dockerfile
+    env_file: .env
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - data:/data
+    restart: unless-stopped
+volumes:
+  data:
