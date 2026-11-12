@@ -50,7 +50,7 @@ class GrowthAutopilotSmokeTests(unittest.TestCase):
         response = self.client.get("/api/status")
         self.assertEqual(response.status_code, 200)
         providers = response.json()["providers"]
-        expected = {"linkedin", "youtube", "instagram", "x", "spotify", "bluesky", "mastodon", "soundcloud"}
+        expected = {"linkedin", "youtube", "instagram", "threads", "x", "spotify", "bluesky", "mastodon", "soundcloud"}
         self.assertEqual(set(providers), expected)
         self.assertEqual(providers["bluesky"]["status"], "available")
 
