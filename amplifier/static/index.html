@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tapas Content Amplifier</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body>
+<section id="login" class="login">
+ <div class="card"><div class="monogram">TA</div><span class="eyebrow">TAPAS ADVISORY</span>
+ <h1>Content Amplifier</h1><p>Secure content operations across five platforms.</p>
+ <form id="signIn"><label>Email<input name="email" type="email" required autocomplete="username"></label>
+ <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
+ <button>Sign in</button></form><p id="error" class="error" role="alert"></p>
+ <small>We do not collect or export social media session cookies.</small></div>
+</section>
+<div id="app" hidden>
+ <aside><div class="identity"><span class="monogram">TA</span><div><strong>Tapas Advisory</strong><small>Content Amplifier</small></div></div>
+ <div class="nav">◈ Growth Overview</div><div class="muted">◇ Campaigns</div><div class="muted">◎ Content Registry</div>
+ <div class="bottom"><p>Account connections and official platform metrics are not configured in this starter.</p><button id="logout" class="outline">Sign out</button></div></aside>
+ <main>
+ <header><div><span class="eyebrow">GROWTH INTELLIGENCE</span><h1>Content Amplifier <span class="version">v0.1 starter</span></h1></div><div id="user" class="pill"></div></header>
+ <div class="notice"><b>Authentic engagement only.</b> Outbound opens are not verified social views or impressions.</div>
+ <div class="stats"><article><span>Campaigns</span><strong id="campaignCount">0</strong></article>
+ <article><span>Registered assets</span><strong id="assetCount">0</strong></article>
+ <article><span>Outbound opens</span><strong id="openCount">0</strong></article>
+ <article><span>Verified views</span><strong>—</strong><small>API not connected</small></article></div>
+ <section class="card"><h2>Platform coverage</h2><div class="platforms"><span>in LinkedIn</span><span>▶ YouTube</span><span>◎ Instagram</span><span>@ Threads</span><span>𝕏 X</span></div><p class="muted">All five platforms currently support human-controlled HTTPS links only.</p></section>
+ <div class="columns">
+ <section class="card"><h2>Create campaign</h2><form id="campaignForm">
+ <label>Name<input name="name" placeholder="Transformation readiness insights" maxlength="120" required></label>
+ <label>Target value<input name="goal" type="number" min="0" value="5000" required></label>
+ <label>Target metric<select name="target_metric"><option value="views">Views</option><option value="impressions">Impressions</option><option value="conversions">Conversions</option></select></label><button>Create campaign</button></form></section>
+ <section class="card"><h2>Add a social asset</h2><form id="assetForm">
+ <label>Campaign<select id="campaignSelect" name="campaign_id" required></select></label>
+ <label>Platform<select name="platform"><option value="linkedin">LinkedIn</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="threads">Threads</option><option value="x">X</option></select></label>
+ <label>Content title<input name="title" maxlength="160" required></label>
+ <label>Post URL<input name="url" type="url" placeholder="https://..." required></label><button>Register asset</button></form></section>
+ </div>
+ <section class="card"><h2>Campaigns</h2><div id="campaignList" class="list"></div></section>
+ <section class="card"><h2>Content registry</h2><div id="assetList" class="list"></div></section>
+ <p id="message" role="status" class="notice" hidden></p>
+ <footer>Tapas Content Amplifier · Human-controlled engagement · No session replay</footer>
+ </main>
+</div>
+</body></html>
